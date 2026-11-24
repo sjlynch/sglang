@@ -30,14 +30,13 @@ def checked_tensor(source, name, shape, *, bf16=False):
 
 
 def read_adapter(source, name, weight):
-    prefix = PREFIX + name
-    a = source.get_tensor(prefix + ".lora_A")
+    a = source.get_tensor(name + ".a")
     if a.ndim != 2 or not 1 <= a.shape[0] <= 256:
         raise ValueError(f"Invalid Inkling drafter adapter rank: {name}")
     rank = a.shape[0]
     return (
-        checked_tensor(source, prefix + ".lora_A", (rank, weight.shape[1])),
-        checked_tensor(source, prefix + ".lora_B", (weight.shape[0], rank)),
+        checked_tensor(source, name + ".a", (rank, weight.shape[1])),
+        checked_tensor(source, name + ".b", (weight.shape[0], rank)),
     )
 
 
@@ -64,13 +63,13 @@ class ThinkingVariant:
             keys = set(source.keys())
             if self.low_rank:
                 supported = {
-                    f"{PREFIX}{name}.{suffix}"
-                    for name in PROJECTIONS for suffix in ("lora_A", "lora_B")
+                    f"{name}.{suffix}"
+                    for name in PROJECTIONS for suffix in ("a", "b")
                 }
                 if not keys or keys - supported:
                     raise ValueError("Expected Markov-only LoRA tensors")
                 for name in PROJECTIONS:
-                    pair = {f"{PREFIX}{name}.{suffix}" for suffix in ("lora_A", "lora_B")}
+                    pair = {f"{name}.{suffix}" for suffix in ("a", "b")}
                     if not keys & pair:
                         continue
                     if not pair <= keys:

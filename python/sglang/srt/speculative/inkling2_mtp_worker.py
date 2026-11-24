@@ -97,7 +97,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         if shared or self.inkling_draft_policy is not None:
             if (
                 self._verify_planner.mode_value != "static" or not self._decode_graph_allowed
-                or self._simulate_acc_len != 0 or self._deferred_draft_kv is not None
+                or self._simulate_acc_len > 0 or self._deferred_draft_kv is not None
             ):
                 raise ValueError("Inkling routing requires static native graphs and real inline verification")
             if not 2 <= self.query_token_num <= self.draft_model.config.block_size:
