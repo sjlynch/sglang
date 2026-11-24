@@ -38,6 +38,7 @@ from sglang.srt.speculative.draft_parallel import (
     resolve_draft_parallel_layout,
 )
 from sglang.srt.speculative.draft_worker_common import (
+    DraftWorkerBundle,
     build_block_pos_offsets,
     build_draft_tp_worker,
     make_draft_block_spec_info,
@@ -185,6 +186,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
         draft_worker_cls: type[TpModelWorker] = TpModelWorker,
+        *,
+        shared_draft: Optional[DraftWorkerBundle] = None,
+        shared_noise_from: Optional["DSparkWorkerV2"] = None,
     ):
         super().__init__()
 
@@ -231,20 +235,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         load_group = get_pp_stage_load_group()
-        with draft_pp_context(), self._draft_context():
-            bundle = build_draft_tp_worker(
-                server_args=server_args,
-                gpu_id=gpu_id,
-                nccl_port=nccl_port,
-                target_model_config=target_worker.model_runner.model_config,
-                algo_label="DSPARK",
-                attention_backend_override=(
-                    DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
-                ),
-                draft_worker_cls=draft_worker_cls,
-                random_seed=target_worker.random_seed,
-                load_group=load_group,
-            )
+        bundle = shared_draft
+        if bundle is None:
+            with draft_pp_context(), self._draft_context():
+                bundle = build_draft_tp_worker(
+                    server_args=server_args,
+                    gpu_id=gpu_id,
+                    nccl_port=nccl_port,
+                    target_model_config=target_worker.model_runner.model_config,
+                    algo_label="DSPARK",
+                    attention_backend_override=(
+                        DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
+                    ),
+                    draft_worker_cls=draft_worker_cls,
+                    random_seed=target_worker.random_seed,
+                    load_group=load_group,
+                )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
@@ -315,7 +321,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
                 )
-        else:
+        elif shared_draft is None:
             target_model = self.target_worker.model_runner.model
             lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
             if lm_head is None or not hasattr(lm_head, "weight"):
@@ -403,16 +409,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
             acceptance_estimator=self._acceptance_estimator,
         )
+        if shared_noise_from is not None:
+            self._proposer._noise = shared_noise_from._proposer.noise
         self._verify_epilogue = None
         self._deferred_draft_kv: Optional[DeferredDraftKVStore] = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
         # Counter-based draws from the server seed: every TP rank draws the same coins,
         # so no accept broadcast is needed.
-        self._rejection_noise = (
-            make_rejection_noise(self.target_worker.random_seed, self.device)
-            if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
-            else None
-        )
+        self._rejection_noise = None
+        if shared_noise_from is not None:
+            self._rejection_noise = shared_noise_from._rejection_noise
+        elif is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get():
+            self._rejection_noise = make_rejection_noise(
+                self.target_worker.random_seed, self.device
+            )
         target_is_dsv41 = target_model_type(self.target_worker) == "deepseek_v41"
         # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the static verify's inputs are final
         # after the head; the target runner stages their metadata beside the draft.

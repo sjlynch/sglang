@@ -47,6 +47,7 @@ from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.inkling_draft_policy import record_round
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -1028,6 +1029,12 @@ class SchedulerBatchResultProcessor:
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+                if result.inkling_draft_route is not None:
+                    phases, variants = result.inkling_draft_route
+                    record_round(
+                        req, phases[i], variants[i], stride - num_non_draft,
+                        num_correct_drafts,
+                    )
 
                 if block_accept_lens is not None:
                     req.spec_num_block_accept_tokens += block_accept_lens[i]

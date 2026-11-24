@@ -210,6 +210,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     redact_server_args_secrets,
 )
+from sglang.srt.speculative.inkling_draft_policy import DraftPolicy, validate_override
 from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
 )
@@ -719,6 +720,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_path = get_model().model_path
         self.served_model_name = get_serving().served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
+        self.inkling_draft_policy = DraftPolicy.from_environment()
         self.is_generation = self.model_config.is_generation
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
@@ -1813,6 +1815,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.token_id_vocab_size)
+        validate_override(sampling_params.custom_params, self.inkling_draft_policy)
         _validate_watermark_request(sampling_params)
 
         # Build return object

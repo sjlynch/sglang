@@ -1202,6 +1202,9 @@ class Scheduler(
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
+        self.inkling_draft_routing = (
+            getattr(self.draft_worker, "inkling_draft_policy", None) is not None
+        )
 
         # Prepare KV cache pools for all workers
         tic = time.perf_counter()
@@ -5376,6 +5379,8 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         launch = self._on_step_launch(batch)
+        if self.inkling_draft_routing:
+            batch._inkling_draft_queue = len(self.waiting_queue)
 
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")

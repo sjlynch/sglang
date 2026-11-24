@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.inkling_draft_policy import telemetry as inkling_draft_telemetry
 from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
 )
@@ -330,6 +331,12 @@ class SchedulerOutputStreamer:
                         f"for {len(acc.output_reqs)} requests"
                     )
                 acc.customized_info[key] = values
+
+        if any(req.finished() and hasattr(req, "_inkling_draft_depth") for req in acc.output_reqs):
+            acc.customized_info["inkling_draft_phases"] = [
+                [summary] if req.finished() and (summary := inkling_draft_telemetry(req)) else []
+                for req in acc.output_reqs
+            ]
 
         # Send to detokenizer
         payload = acc.to_payload(

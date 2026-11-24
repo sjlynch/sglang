@@ -152,6 +152,8 @@ class GenerationBatchResult:
     # Padded row width in flattened speculative output. Existing algorithms
     # default to speculative_num_draft_tokens; linear UNO emits F + 1 columns.
     speculative_output_stride: Optional[int] = None
+    # Inkling round-start phase and resident-variant mask in batch row order.
+    inkling_draft_route: Optional[tuple[tuple[bool, ...], tuple[bool, ...]]] = None
     # Valid output tokens that are not accepted draft proposals. Existing
     # algorithms have one bonus token; UNO also emits its clean root.
     num_non_draft_tokens_per_req: int = 1

@@ -42,6 +42,7 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         self._fold_bias = None
         self._gather_logits = None
         self._get_staged_f = None
+        self.thinking_variant = None
 
     @torch.no_grad()
     def attach_fold(self, weight, multiplier):
@@ -71,7 +72,10 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
 
     def _rnn_step(self, state, prev_tokens, hidden, f_rnn):
         inputs = rnn_inputs(state, prev_tokens, self.markov_w1.weight, hidden, f_rnn)
-        return rnn_gates(self.rnn_proj(inputs), state)
+        projected = self.rnn_proj(inputs)
+        if self.thinking_variant is not None:
+            projected = self.thinking_variant.recurrent_projection(inputs, projected)
+        return rnn_gates(projected, state)
 
     def init_state(self, hidden_states):
         batch_size = hidden_states.shape[0]
@@ -92,6 +96,10 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         bias = torch.addmm(
             self._fold_bias, latent.to(self._fold_weight.dtype), self._fold_weight.T
         )
+        if self.thinking_variant is not None:
+            bias = self.thinking_variant.output_projection(
+                latent.to(self._fold_weight.dtype), bias
+            )
         if self.vocab_shard is None:
             bias = self._gather_logits(bias)
         return bias, (state, f_rnn)
