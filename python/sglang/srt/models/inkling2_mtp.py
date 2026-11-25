@@ -423,6 +423,14 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             self._fuse_alpha = fuse_alpha
         else:
             self._fuse_alpha.copy_(fuse_alpha)
+        if self.lm_head is not None and self.markov_head._fold_weight is not None:
+            # Online draft update (update_weights_from_tensor/disk with selector "draft"): the
+            # folded Markov output projection is derived from hidden_out at attach time, so
+            # refresh it in place (captured graphs keep its address) or the swapped head would
+            # propose through the previous head's fold.
+            self.markov_head.refresh_fold(
+                self.lm_head.weight, self.logits_mup_width_multiplier
+            )
         return loaded
 
 
