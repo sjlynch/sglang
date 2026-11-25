@@ -226,6 +226,25 @@ class DraftPolicyTests(unittest.TestCase):
                     policy.DraftPolicy.read(path)
 
 
+    def test_pin_fixes_one_captured_graph_and_keeps_phases(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            manifest = {
+                "version": 1, "stock_sha256": "a" * 64, "batch_mode": "width",
+                "widths": [{"max_load": None, "thinking": 8, "answer": 4}],
+                "pin": {"head": 0, "width": 4},
+            }
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            rules = policy.DraftPolicy.read(path)
+            self.assertEqual((rules.capture_widths, rules.pin), ((4, 8), (0, 4)))
+            thinking = request((policy.THINK_START,))
+            self.assertEqual(policy.select_batch_round(rules, [thinking], 0), (0, 4, (True,)))
+            for pin, mode in (({"head": 1, "width": 4}, "width"), ({"head": 0, "width": 5}, "width"),
+                              ({"head": 0, "width": 4}, None), ({"head": 0}, "width")):
+                path.write_text(json.dumps(dict(manifest, pin=pin, batch_mode=mode)), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    policy.DraftPolicy.read(path)
+
 def bench(rounds=100_000):
     rules = config()
     batch = [request() for _ in range(4)]

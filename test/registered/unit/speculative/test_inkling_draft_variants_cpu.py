@@ -113,6 +113,7 @@ class ThinkingVariantTests(unittest.TestCase):
                 super().__init__()
                 self.rnn_proj = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
                 self.hidden_out = torch.nn.Linear(1, 2, dtype=torch.bfloat16)
+                self.dflare_norm = torch.nn.LayerNorm(2, dtype=torch.bfloat16)
                 self.fold = bf16([[0]])
 
             def refresh_fold(self, weight, multiplier):
@@ -124,6 +125,9 @@ class ThinkingVariantTests(unittest.TestCase):
                 self.embed_tokens = torch.nn.Embedding(1, 2, dtype=torch.bfloat16)
                 self.lm_head = torch.nn.Linear(2, 1, dtype=torch.bfloat16)
                 self.markov_head = Head()
+                self.context_writer = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
+                self.fuse_weight = torch.nn.Parameter(bf16([[1, 1]]), requires_grad=False)
+                self._fuse_alpha = bf16([[0.5, 0.5]])
                 self._f_rnn_buf = bf16([[1, 1]])
                 self._f_rnn_rows = None
                 self.config = object()
@@ -152,6 +156,15 @@ class ThinkingVariantTests(unittest.TestCase):
         self.assertTrue(torch.equal(merged.markov_head.fold, bf16([[5]])))
         self.assertTrue(torch.equal(stock.markov_head.rnn_proj.weight, bf16([[0, 0], [0, 0]])))
         self.assertTrue(torch.equal(stock.markov_head.fold, bf16([[0]])))
+        # Markov variants share every context writer by identity, never by value.
+        self.assertIs(merged.context_writer, stock.context_writer)
+        self.assertIs(merged.fuse_weight, stock.fuse_weight)
+        self.assertIs(merged._fuse_alpha, stock._fuse_alpha)
+        self.assertIs(merged.markov_head.dflare_norm, stock.markov_head.dflare_norm)
+        self.assertIsNot(merged.markov_head.fold, stock.markov_head.fold)
+        stock._f_rnn_buf = None
+        with self.assertRaisesRegex(ValueError, "committed recurrent state"):
+            variants.build_batch_head(artifact, stock, None)
 
     def test_native_head_rejects_incompatible_shared_prefix(self):
         ctx = "layers.0.self_attn.k_proj_ctx.weight"

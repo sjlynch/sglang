@@ -6,7 +6,7 @@ import os
 import re
 from itertools import islice
 from time import perf_counter_ns
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 DRAFT_MANIFEST_ENV = "SGLANG_INKLING_DRAFT_MANIFEST"
@@ -58,6 +58,9 @@ class DraftPolicy:
     thinking: Artifact | None = None
     anchor_suffix_width8: bool = False
     batch_mode: str | None = None
+    # Diagnostic: (head, width) every decode round uses while the mode's full graph
+    # table is still captured. Isolates one captured graph for identity tests.
+    pin: tuple[int, int] | None = None
 
     @property
     def capture_widths(self):
@@ -93,7 +96,7 @@ class DraftPolicy:
         payload = json.loads(data)
         if (
             not isinstance(payload, dict)
-            or payload.keys() - {"version", "stock_sha256", "thinking", "widths", "anchor_suffix_width8", "batch_mode"}
+            or payload.keys() - {"version", "stock_sha256", "thinking", "widths", "anchor_suffix_width8", "batch_mode", "pin"}
             or type(payload.get("version")) is not int
             or payload["version"] != 1
         ):
@@ -151,7 +154,18 @@ class DraftPolicy:
             raise ValueError("Batch head switching requires a resident thinking artifact")
         if artifact and artifact.kind == "native-head" and batch_mode is None:
             raise ValueError("A native head requires batch routing")
-        return cls(tuple(widths), sha256_field(payload.get("stock_sha256")), artifact, suffix_flag, batch_mode)
+        policy = cls(tuple(widths), sha256_field(payload.get("stock_sha256")), artifact, suffix_flag, batch_mode)
+        if "pin" in payload:
+            row = payload["pin"]
+            if (
+                batch_mode is None or not isinstance(row, dict) or row.keys() != {"head", "width"}
+                or type(row["head"]) is not int or type(row["width"]) is not int
+                or not 0 <= row["head"] < policy.capture_heads
+                or row["width"] not in policy.capture_widths
+            ):
+                raise ValueError("A pin requires batch routing and a captured head and width")
+            policy = replace(policy, pin=(row["head"], row["width"]))
+        return policy
 
     @classmethod
     def from_environment(cls):
@@ -314,6 +328,9 @@ def select_batch_round(policy, requests, queued, completed_channels=None):
     requested_width, phases, _ = select_round(
         policy, requests, queued, completed_channels=completed_channels
     )
+    if policy.pin is not None:
+        # Phases still advance and are reported; only the graph choice is fixed.
+        return policy.pin[0], policy.pin[1], phases
     width = requested_width if policy.batch_mode in ("width", "both") else 4
     head = int(policy.capture_heads == 2 and 2 * sum(phases) > len(phases))
     return head, width, phases

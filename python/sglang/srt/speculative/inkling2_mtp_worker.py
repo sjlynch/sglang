@@ -111,6 +111,13 @@ class Inkling2MTPWorker(DSparkWorkerV2):
                 raise ValueError("Inkling routing requires static native graphs and real inline verification")
             if not 2 <= self.query_token_num <= self.draft_model.config.block_size:
                 raise ValueError("Inkling routing width exceeds the checkpoint block size")
+            if any(
+                getattr(layer, name, None) is not None
+                for layer in self.draft_model.layers for name in ("attention_conv", "mlp_conv")
+            ):
+                # Width views share draft layers; a block-size-indexed convolution would
+                # take the last view's block size for every width.
+                raise ValueError("Inkling routing cannot share block-size-dependent draft layers")
             self.draft_model.block_size = self.query_token_num
             self.draft_model.gamma = self.gamma
         else:
@@ -198,6 +205,8 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             if "make_draft_sampler_capture_hook" not in hook.__qualname__
         ]
         model = copy(self.draft_model if resident_model is None else resident_model)
+        if model._f_rnn_buf is None or model._f_rnn_buf is not self.draft_model._f_rnn_buf:
+            raise ValueError("Every Inkling routing graph must read the one committed recurrent state")
         model._modules = model._modules.copy()
         model.markov_head = copy(model.markov_head)
         model.markov_head._get_staged_f = lambda: model._f_rnn_rows
@@ -213,15 +222,11 @@ class Inkling2MTPWorker(DSparkWorkerV2):
                 self.server_args, self.gpu_id, self.nccl_port, target,
                 shared_draft=bundle, shared_noise_from=self,
             )
-            if (
-                resident_model is not None
-                and self._verify_epilogue is not None
-                and worker._verify_epilogue is not None
-            ):
-                # All overlap graphs publish by request slot into the one FutureMap
-                # adopted from the stock capture. Verify/accept outputs stay local.
-                relay = self._verify_epilogue.future_relay
-                worker._verify_epilogue.future_relay = relay
+            if self._verify_epilogue is not None and worker._verify_epilogue is not None:
+                # All graphs publish by request slot into the one FutureMap relay adopted
+                # from the stock capture (None unless POST_FOLD). A width view must never
+                # build and offer its own relay, which would replace the adopted one.
+                worker._verify_epilogue.future_relay = self._verify_epilogue.future_relay
             worker.init_attention_backends()
             target_runner.decode_cuda_graph_runner = DecodeCudaGraphRunner(
                 target_runner, speculative_num_draft_tokens=width
@@ -240,9 +245,10 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             return super().forward_batch_generation(batch, on_publish, grammar_barrier, **kwargs)
         if policy.batch_mode is not None:
             head, width, phases = select_batch_round(
-                policy, batch.reqs, batch._inkling_draft_queue,
-                batch._inkling_draft_completed_channels,
+                policy, batch.reqs, getattr(batch, "_inkling_draft_queue", 0),
+                getattr(batch, "_inkling_draft_completed_channels", None),
             )
+            batch._inkling_draft_completed_channels = None
             index = head * len(self._batch_width_index) + self._batch_width_index[width]
             worker = self._batch_workers[index]
             with get_spec().override(speculative_num_draft_tokens=width):

@@ -75,9 +75,28 @@ def build_batch_head(artifact, model, stock_path):
     verify_file(artifact.path, artifact.sha256)
     # Target embeddings and unembed are immutable. The shared committed recurrent buffer
     # is valid only for variants with unchanged context projections and normalization.
+    if model._f_rnn_buf is None:
+        raise ValueError("Allocate the committed recurrent state before building resident heads")
     shared = (model.embed_tokens, model.lm_head, model._f_rnn_buf, model.config)
     memo = {id(value): value for value in shared if value is not None}
+    if artifact.kind != "native-head":
+        # A Markov variant changes only rnn_proj/hidden_out and its fold. Share every other
+        # module and tensor, so the 14 context writers are the stock tensors by identity and
+        # the draft layers are not duplicated. The fold buffers stay private: refresh_fold
+        # writes them in place.
+        for name, module in model.named_children():
+            if name != "markov_head":
+                memo[id(module)] = module
+        tensors = (*model.parameters(recurse=False), *model.buffers(recurse=False),
+                   *(value for value in vars(model).values() if isinstance(value, torch.Tensor)))
+        for value in tensors:
+            memo[id(value)] = value
+        for name, module in model.markov_head.named_children():
+            if name not in PROJECTIONS:
+                memo[id(module)] = module
     variant = deepcopy(model, memo)
+    if variant._f_rnn_buf is not model._f_rnn_buf:
+        raise ValueError("Resident heads must share the committed recurrent state")
     head = variant.markov_head
     head._get_staged_f = lambda: variant._f_rnn_rows
     head._gather_logits = variant._gather_logits
