@@ -21,6 +21,7 @@ OTHER_CHANNELS = frozenset(
 CHANNELS = dict.fromkeys(OTHER_CHANNELS | {THINK_END}, "answer")
 CHANNELS.update({THINK_START: "thinking", 200049: "tool", 200057: "tool"})
 WIDTHS = (4, 5, 6, 8)  # Includes the target anchor.
+BATCH_MODES = ("control", "width", "head", "both")
 
 
 def sha256_field(value):
@@ -56,9 +57,12 @@ class DraftPolicy:
     stock_sha256: str
     thinking: Artifact | None = None
     anchor_suffix_width8: bool = False
+    batch_mode: str | None = None
 
     @property
     def capture_widths(self):
+        if self.batch_mode in ("control", "head"):
+            return (4,)
         widths = {
             width for tier in self.widths
             for width in (tier.thinking, tier.answer, tier.thinking_long, tier.answer_structured)
@@ -66,7 +70,13 @@ class DraftPolicy:
         }
         if self.anchor_suffix_width8:
             widths.add(8)
+        if self.batch_mode is not None:
+            widths.add(4)
         return tuple(sorted(widths))
+
+    @property
+    def capture_heads(self):
+        return 2 if self.batch_mode in ("head", "both") else 1
 
     def tier(self, active, queued):
         load = active + queued
@@ -83,7 +93,7 @@ class DraftPolicy:
         payload = json.loads(data)
         if (
             not isinstance(payload, dict)
-            or payload.keys() - {"version", "stock_sha256", "thinking", "widths", "anchor_suffix_width8"}
+            or payload.keys() - {"version", "stock_sha256", "thinking", "widths", "anchor_suffix_width8", "batch_mode"}
             or type(payload.get("version")) is not int
             or payload["version"] != 1
         ):
@@ -120,19 +130,28 @@ class DraftPolicy:
         suffix_flag = payload.get("anchor_suffix_width8", False)
         if type(suffix_flag) is not bool:
             raise ValueError("The anchor suffix flag must be boolean")
+        batch_mode = payload.get("batch_mode")
+        if "batch_mode" in payload and batch_mode not in BATCH_MODES:
+            raise ValueError(f"Batch routing mode must be one of {BATCH_MODES}")
+        if batch_mode is not None and suffix_flag:
+            raise ValueError("Batch routing uses scheduler demand without suffix indexing")
         artifact = None
         if "thinking" in payload:
             row = payload["thinking"]
             if (
                 not isinstance(row, dict)
                 or row.keys() != {"kind", "path", "sha256"}
-                or row["kind"] not in ("markov-head", "markov-lora")
+                or row["kind"] not in ("markov-head", "markov-lora", "native-head")
                 or not isinstance(row["path"], str)
                 or not Path(row["path"]).is_absolute()
             ):
-                raise ValueError("Thinking variant requires a pinned local Markov head or LoRA")
+                raise ValueError("Thinking variant requires a pinned local head or adapter")
             artifact = Artifact(row["kind"], Path(row["path"]), sha256_field(row["sha256"]))
-        return cls(tuple(widths), sha256_field(payload.get("stock_sha256")), artifact, suffix_flag)
+        if batch_mode in ("head", "both") and artifact is None:
+            raise ValueError("Batch head switching requires a resident thinking artifact")
+        if artifact and artifact.kind == "native-head" and batch_mode is None:
+            raise ValueError("A native head requires batch routing")
+        return cls(tuple(widths), sha256_field(payload.get("stock_sha256")), artifact, suffix_flag, batch_mode)
 
     @classmethod
     def from_environment(cls):
@@ -144,6 +163,8 @@ def validate_override(custom_params, policy):
     if not custom_params or "inkling_draft_variant" not in custom_params:
         return
     override = custom_params["inkling_draft_variant"]
+    if policy is not None and policy.batch_mode is not None and override != "auto":
+        raise ValueError("Batch routing supports only the automatic variant policy")
     if policy is None or (
         override != "auto" and override != "stock"
         and not (override == "thinking" and policy.thinking)
@@ -223,7 +244,34 @@ class AnchorSuffixMatch:
         return self.tail in self.prior
 
 
-def select_round(policy, requests, queued, suffix_stats=None):
+def completed_batch_channels(batch, result):
+    """Peek at the existing host readback without waiting for the forward stream."""
+    lens = getattr(result, "accept_lens", None)
+    tokens = getattr(result, "next_token_ids", None)
+    if (
+        not batch.forward_mode.is_decode()
+        or lens is None or not lens.is_cpu
+        or tokens is None or not tokens.is_cpu
+        or result.copy_done is None or not result.copy_done.query()
+    ):
+        return None
+    stride = result.speculative_output_stride
+    if stride is None:
+        stride = result.speculative_num_draft_tokens
+    if stride is None or stride < 1:
+        return None
+    tokens = tokens.tolist()
+    channels = {}
+    for row, (req, count) in enumerate(zip(batch.reqs, lens.tolist())):
+        if getattr(req, "grammar", None) is None:
+            start = row * stride
+            channel = channel_after(tokens[start:start + count], None)
+            if channel is not None:
+                channels[id(req)] = channel
+    return channels or None
+
+
+def select_round(policy, requests, queued, suffix_stats=None, completed_channels=None):
     phases, variants = [], []
     widths = []
     tier = policy.tier(len(requests), queued)
@@ -231,7 +279,11 @@ def select_round(policy, requests, queued, suffix_stats=None):
         state = getattr(req, "_inkling_draft_phase", None)
         if state is None:
             state = req._inkling_draft_phase = RequestPhase.from_request(req)
-        thinking = state.update(req)
+        state.update(req)
+        channel = state.channel
+        if completed_channels:
+            channel = completed_channels.get(id(req), channel)
+        thinking = channel == "thinking"
         phases.append(thinking)
         variants.append(state.variant(policy.thinking is not None))
         observation = None
@@ -248,13 +300,23 @@ def select_round(policy, requests, queued, suffix_stats=None):
                 if hit:
                     width = 8
         else:
-            structured = state.channel == "tool" or getattr(req, "grammar", None) is not None
+            structured = channel == "tool" or getattr(req, "grammar", None) is not None
             width = tier.answer_structured if structured and tier.answer_structured is not None else tier.answer
         widths.append(width)
         if suffix_stats is not None:
             suffix_stats.append(observation)
     # One native rectangular graph must fit every request in the round.
     return min(widths), tuple(phases), tuple(variants)
+
+
+def select_batch_round(policy, requests, queued, completed_channels=None):
+    """Choose the next batch from committed host state and scheduler counts."""
+    requested_width, phases, _ = select_round(
+        policy, requests, queued, completed_channels=completed_channels
+    )
+    width = requested_width if policy.batch_mode in ("width", "both") else 4
+    head = int(policy.capture_heads == 2 and 2 * sum(phases) > len(phases))
+    return head, width, phases
 
 
 @dataclass

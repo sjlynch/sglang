@@ -18,7 +18,12 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.draft_worker_common import DraftWorkerBundle
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
-from sglang.srt.speculative.inkling_draft_policy import DraftPolicy, select_round
+from sglang.srt.speculative.inkling_draft_policy import (
+    DraftPolicy,
+    RequestPhase,
+    select_batch_round,
+    select_round,
+)
 from sglang.srt.utils.device import async_h2d
 
 logger = logging.getLogger(__name__)
@@ -79,14 +84,18 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         shared = kwargs.get("shared_draft") is not None
         self.inkling_draft_policy = None if shared else DraftPolicy.from_environment()
         self._width_workers = {}
+        self._batch_workers = ()
+        self._batch_width_index = {}
         if self.inkling_draft_policy is not None:
+            policy = self.inkling_draft_policy
             parallel = get_parallel()
             if (
                 parallel.tp_size != 1 or parallel.pp_size != 1 or parallel.attn_dp_enabled
-                or not get_schedule().disable_overlap_schedule or get_lora().enable_lora
+                or get_lora().enable_lora
             ):
-                raise ValueError("Inkling drafter routing requires TP1/PP1, no overlap or target LoRA")
-            policy = self.inkling_draft_policy
+                raise ValueError("Inkling drafter routing requires TP1/PP1 and unadapted target weights")
+            if get_schedule().disable_overlap_schedule != (policy.batch_mode is None):
+                raise ValueError("Batch routing requires overlap and legacy mixed-row routing requires non-overlap")
             if get_spec().speculative_num_draft_tokens != policy.capture_widths[-1]:
                 raise ValueError("DSpark startup width must equal the largest routing width")
             stock = Path(get_spec().speculative_draft_model_path) / "mtp.safetensors"
@@ -106,7 +115,10 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             self.draft_model.gamma = self.gamma
         else:
             self.draft_model.set_block_size(self.query_token_num)
-        if self.inkling_draft_policy is not None and self.inkling_draft_policy.thinking:
+        if (
+            self.inkling_draft_policy is not None and self.inkling_draft_policy.thinking
+            and self.inkling_draft_policy.batch_mode is None
+        ):
             from sglang.srt.speculative.inkling_draft_variants import ThinkingVariant
 
             variant = ThinkingVariant(
@@ -140,11 +152,27 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         self.draft_model.ensure_propose_staging(req_pool.req_to_token.shape[0])
 
     def init_cuda_graphs(self):
-        super().init_cuda_graphs()
         policy = self.inkling_draft_policy
+        models = [self.draft_model]
+        if policy is not None and policy.capture_heads == 2:
+            from sglang.srt.speculative.inkling_draft_variants import build_batch_head
+
+            stock = Path(get_spec().speculative_draft_model_path) / "mtp.safetensors"
+            models.append(build_batch_head(policy.thinking, self.draft_model, stock))
+        super().init_cuda_graphs()
         if policy is None:
             return
         self._assert_native_graphs()
+        if policy.batch_mode is not None:
+            widths = policy.capture_widths
+            self._batch_width_index = {width: i for i, width in enumerate(widths)}
+            self._batch_workers = tuple(
+                self if head == 0 and width == self.verify_num_draft_tokens
+                else self._capture_width(width, model)
+                for head, model in enumerate(models) for width in widths
+            )
+            logger.info("Inkling batch routing captured %d resident heads at widths %s", len(models), widths)
+            return
         for width in policy.capture_widths:
             self._width_workers[width] = (
                 self if width == self.verify_num_draft_tokens else self._capture_width(width)
@@ -156,7 +184,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             if not isinstance(runner.decode_cuda_graph_runner, DecodeCudaGraphRunner):
                 raise ValueError("Inkling drafter routing requires both native decode graphs")
 
-    def _capture_width(self, width):
+    def _capture_width(self, width, resident_model=None):
         target = _worker_view(self.target_worker)
         draft = _worker_view(self.draft_worker)
         target_runner = target.model_runner
@@ -169,7 +197,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             hook for hook in draft_runner.capture_tail_hooks
             if "make_draft_sampler_capture_hook" not in hook.__qualname__
         ]
-        model = copy(self.draft_model)
+        model = copy(self.draft_model if resident_model is None else resident_model)
         model._modules = model._modules.copy()
         model.markov_head = copy(model.markov_head)
         model.markov_head._get_staged_f = lambda: model._f_rnn_rows
@@ -185,6 +213,15 @@ class Inkling2MTPWorker(DSparkWorkerV2):
                 self.server_args, self.gpu_id, self.nccl_port, target,
                 shared_draft=bundle, shared_noise_from=self,
             )
+            if (
+                resident_model is not None
+                and self._verify_epilogue is not None
+                and worker._verify_epilogue is not None
+            ):
+                # All overlap graphs publish by request slot into the one FutureMap
+                # adopted from the stock capture. Verify/accept outputs stay local.
+                relay = self._verify_epilogue.future_relay
+                worker._verify_epilogue.future_relay = relay
             worker.init_attention_backends()
             target_runner.decode_cuda_graph_runner = DecodeCudaGraphRunner(
                 target_runner, speculative_num_draft_tokens=width
@@ -196,7 +233,22 @@ class Inkling2MTPWorker(DSparkWorkerV2):
     def forward_batch_generation(self, batch, on_publish=None, grammar_barrier=None, **kwargs):
         policy = self.inkling_draft_policy
         if policy is None or not batch.forward_mode.is_decode() or batch.is_extend_in_batch:
+            if policy is not None and policy.batch_mode is not None and batch.forward_mode.is_extend():
+                for req in batch.reqs:
+                    if not hasattr(req, "_inkling_draft_phase"):
+                        req._inkling_draft_phase = RequestPhase.from_request(req)
             return super().forward_batch_generation(batch, on_publish, grammar_barrier, **kwargs)
+        if policy.batch_mode is not None:
+            head, width, phases = select_batch_round(
+                policy, batch.reqs, batch._inkling_draft_queue,
+                batch._inkling_draft_completed_channels,
+            )
+            index = head * len(self._batch_width_index) + self._batch_width_index[width]
+            worker = self._batch_workers[index]
+            with get_spec().override(speculative_num_draft_tokens=width):
+                result = worker._forward_decode(batch, on_publish, grammar_barrier)
+            result.inkling_draft_route = phases, (bool(head),) * len(phases)
+            return result
         suffix_stats = [] if policy.anchor_suffix_width8 else None
         width, phases, variants = select_round(
             policy, batch.reqs, batch._inkling_draft_queue, suffix_stats

@@ -1,6 +1,7 @@
 """Standalone CPU checks and c4 routing micro-benchmark (no SGLang imports)."""
 
 import importlib.util
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -35,6 +36,53 @@ def config(artifact=True):
 
 
 class DraftPolicyTests(unittest.TestCase):
+    def test_overlap_factorial_modes_and_queue_pressure(self):
+        base = config()
+        reqs = [request((policy.THINK_START,)) for _ in range(2)]
+        for mode, expected in {
+            "control": (0, 4), "width": (0, 6), "head": (1, 4), "both": (1, 6),
+        }.items():
+            rules = replace(base, batch_mode=mode)
+            self.assertEqual(policy.select_batch_round(rules, reqs, 0)[:2], expected)
+        rules = replace(base, batch_mode="both")
+        self.assertEqual(policy.select_batch_round(rules, reqs, 1)[:2], (1, 8))
+        self.assertEqual(policy.select_batch_round(rules, [reqs[0], request()], 0)[:2], (0, 4))
+
+    def test_overlap_uses_ready_previous_stride_without_advancing_phase(self):
+        old = request((policy.THINK_START,))
+        other = request()
+        mode = SimpleNamespace(is_decode=lambda: True)
+        batch = SimpleNamespace(reqs=[old, other], forward_mode=mode)
+        ready = False
+
+        def cpu(values):
+            def tolist():
+                self.assertTrue(ready)
+                return values
+            return SimpleNamespace(is_cpu=True, tolist=tolist)
+
+        result = SimpleNamespace(
+            accept_lens=cpu([1, 2]),
+            next_token_ids=cpu([policy.THINK_END, policy.THINK_START, 0, 0, 0, 0,
+                                1, policy.THINK_START, policy.THINK_END, 0, 0, 0]),
+            copy_done=SimpleNamespace(query=lambda: ready),
+            speculative_output_stride=6,
+            speculative_num_draft_tokens=8,
+        )
+        rules = replace(config(), batch_mode="both")
+        self.assertIsNone(policy.completed_batch_channels(batch, result))
+        self.assertEqual(policy.select_batch_round(rules, [old], 0), (1, 6, (True,)))
+        ready = True
+        channels = policy.completed_batch_channels(batch, result)
+        self.assertEqual(channels, {id(old): "answer", id(other): "thinking"})
+        self.assertEqual(policy.select_batch_round(rules, [old], 0, channels), (0, 4, (False,)))
+        self.assertEqual(old._inkling_draft_phase.seen, 0)
+        self.assertEqual(old._inkling_draft_phase.channel, "thinking")
+        old.output_ids.append(policy.THINK_END)
+        self.assertEqual(policy.select_batch_round(rules, [old], 0), (0, 4, (False,)))
+        result.next_token_ids.is_cpu = False
+        self.assertIsNone(policy.completed_batch_channels(batch, result))
+
     def test_context_load_table_and_structured_answer(self):
         rules = policy.DraftPolicy(
             (
@@ -232,9 +280,45 @@ def bench_suffix(rounds=20_000):
     return passed
 
 
+def bench_overlap(rounds=100_000):
+    rules = replace(config(), batch_mode="both")
+    passed = True
+    widths = {width: index for index, width in enumerate(rules.capture_widths)}
+    graph_table = tuple(object() for _ in range(rules.capture_heads * len(widths)))
+    for active in (1, 4):
+        reqs = [request((policy.THINK_START,)) for _ in range(active)]
+        policy.select_batch_round(rules, reqs, 0)
+        batch = SimpleNamespace(reqs=reqs, forward_mode=SimpleNamespace(is_decode=lambda: True))
+        result = SimpleNamespace(
+            accept_lens=SimpleNamespace(is_cpu=True, tolist=lambda: [4] * active),
+            next_token_ids=SimpleNamespace(
+                is_cpu=True, tolist=lambda: [42, policy.THINK_END, 17, 99, 0, 0, 0, 0] * active,
+            ),
+            copy_done=SimpleNamespace(query=lambda: True),
+            speculative_output_stride=8,
+        )
+        samples = []
+        for i in range(rounds + 4_000):
+            start = time.perf_counter_ns()
+            channels = policy.completed_batch_channels(batch, result)
+            head, width, _ = policy.select_batch_round(rules, reqs, i % 5, channels if i % 2 else None)
+            graph_table[head * len(widths) + widths[width]]
+            elapsed = time.perf_counter_ns() - start
+            if i >= 4_000:
+                samples.append(elapsed)
+        samples.sort()
+        p95, p99 = samples[int(rounds * .95)] / 1000, samples[int(rounds * .99)] / 1000
+        print(f"c{active} overlap dispatch ({rounds} rounds, simulated ready copy): "
+              f"p50={median(samples) / 1000:.2f} us p95={p95:.2f} us p99={p99:.2f} us")
+        passed &= p99 <= 100
+    return passed
+
+
 if __name__ == "__main__":
     if "--bench" in sys.argv:
         sys.exit(0 if bench() else 1)
     if "--bench-suffix" in sys.argv:
         sys.exit(0 if bench_suffix() else 1)
+    if "--bench-overlap" in sys.argv:
+        sys.exit(0 if bench_overlap() else 1)
     unittest.main()

@@ -1,7 +1,8 @@
-"""Resident Markov projections shared by all native widths."""
+"""Startup loading for resident Inkling draft variants."""
 
 import hashlib
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -48,6 +49,72 @@ def fold_delta(lm_head, matrix, multiplier):
         rows = slice(start, start + 4096)
         result[rows].copy_((lm_head[rows].double() @ matrix) / (multiplier or 1))
     return result
+
+
+def writes_shared_context(name):
+    # These parameters produce the committed draft KV and recurrent state, not the proposal alone.
+    return name == "fuse_weight" or any(
+        segment in name for segment in (".dflare_norm.", ".kv_proj_ctx.", ".k_proj_ctx.", ".v_proj_ctx.", ".k_norm_ctx.")
+    )
+
+
+def native_head_tensors(source, stock):
+    if set(source.keys()) != set(stock.keys()):
+        raise ValueError("Resident native head schema differs from the stock checkpoint")
+    for name in source.keys():
+        original = stock.get_tensor(name)
+        tensor = checked_tensor(source, name, original.shape, bf16=True)
+        if writes_shared_context(name) and not torch.equal(tensor, original):
+            raise ValueError(f"Resident head changes shared prefix state: {name}")
+        yield name, tensor
+
+
+@torch.no_grad()
+def build_batch_head(artifact, model, stock_path):
+    """Materialize independent draft parameters before the variant graphs capture their addresses."""
+    verify_file(artifact.path, artifact.sha256)
+    # Target embeddings and unembed are immutable. The shared committed recurrent buffer
+    # is valid only for variants with unchanged context projections and normalization.
+    shared = (model.embed_tokens, model.lm_head, model._f_rnn_buf, model.config)
+    memo = {id(value): value for value in shared if value is not None}
+    variant = deepcopy(model, memo)
+    head = variant.markov_head
+    head._get_staged_f = lambda: variant._f_rnn_rows
+    head._gather_logits = variant._gather_logits
+    variant._f_rnn_rows = None
+    with safe_open(artifact.path, framework="pt", device="cpu") as source:
+        if artifact.kind == "native-head":
+            # Parameter.__deepcopy__ drops the custom packed/sharded loaders.
+            # Bind loaders to the cloned layers before reading checkpoint shards.
+            for name, parameter in model.named_parameters():
+                if not name.startswith(("embed_tokens.", "lm_head.")):
+                    vars(memo[id(parameter)]).update(deepcopy(vars(parameter), memo))
+            with safe_open(stock_path, framework="pt", device="cpu") as stock:
+                variant.load_weights(native_head_tensors(source, stock))
+        elif artifact.kind == "markov-head":
+            for name in PROJECTIONS:
+                layer = getattr(head, name)
+                for suffix in ("weight", "bias"):
+                    parameter = getattr(layer, suffix)
+                    parameter.copy_(checked_tensor(source, f"{PREFIX}{name}.{suffix}", parameter.shape, bf16=True))
+        else:
+            keys = set(source.keys())
+            supported = {f"{name}.{suffix}" for name in PROJECTIONS for suffix in ("a", "b")}
+            if not keys or keys - supported:
+                raise ValueError("Expected Markov-only LoRA tensors")
+            for name in PROJECTIONS:
+                pair = {f"{name}.{suffix}" for suffix in ("a", "b")}
+                if not keys & pair:
+                    continue
+                if not pair <= keys:
+                    raise ValueError(f"Missing LoRA matrix for {name}")
+                weight = getattr(head, name).weight
+                a, b = read_adapter(source, name, weight)
+                a = a.to(device=weight.device, dtype=torch.float32)
+                b = b.to(device=weight.device, dtype=torch.float32)
+                weight.copy_(weight.float() + b @ a)
+    head.refresh_fold(variant.lm_head.weight, variant.logits_mup_width_multiplier)
+    return variant
 
 
 class ThinkingVariant:

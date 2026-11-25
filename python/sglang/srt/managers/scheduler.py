@@ -1202,8 +1202,10 @@ class Scheduler(
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
-        self.inkling_draft_routing = (
-            getattr(self.draft_worker, "inkling_draft_policy", None) is not None
+        draft_policy = getattr(self.draft_worker, "inkling_draft_policy", None)
+        self.inkling_draft_routing = draft_policy is not None
+        self.inkling_batch_routing = (
+            draft_policy is not None and draft_policy.batch_mode is not None
         )
 
         # Prepare KV cache pools for all workers
@@ -5381,7 +5383,6 @@ class Scheduler(
         launch = self._on_step_launch(batch)
         if self.inkling_draft_routing:
             batch._inkling_draft_queue = len(self.waiting_queue)
-
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
@@ -5417,6 +5418,12 @@ class Scheduler(
                     self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
+                if self.inkling_batch_routing and batch.forward_mode.is_decode():
+                    from sglang.srt.speculative.inkling_draft_policy import completed_batch_channels
+
+                    batch._inkling_draft_completed_channels = (
+                        completed_batch_channels(*self.result_queue[-1]) if self.result_queue else None
+                    )
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)

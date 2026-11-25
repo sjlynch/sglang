@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 SOURCE = Path(__file__).resolve().parents[4] / "python/sglang/srt/speculative/inkling_draft_variants.py"
@@ -105,6 +106,68 @@ class ThinkingVariantTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'larger than its captured batch'):
                 runtime.stage((True,) * 5)
         self.assertEqual(runtime.mask[:, 0].tolist(), [False, True, False, False])
+
+    def test_batch_head_premerge_owns_weights_and_shares_immutable_modules(self):
+        class Head(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.rnn_proj = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
+                self.hidden_out = torch.nn.Linear(1, 2, dtype=torch.bfloat16)
+                self.fold = bf16([[0]])
+
+            def refresh_fold(self, weight, multiplier):
+                self.fold.copy_((weight.float() @ self.hidden_out.weight.float()) / multiplier)
+
+        class Draft(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(1, 2, dtype=torch.bfloat16)
+                self.lm_head = torch.nn.Linear(2, 1, dtype=torch.bfloat16)
+                self.markov_head = Head()
+                self._f_rnn_buf = bf16([[1, 1]])
+                self._f_rnn_rows = None
+                self.config = object()
+                self.logits_mup_width_multiplier = 2
+
+            def _gather_logits(self, logits):
+                return logits
+
+        stock = Draft()
+        with torch.no_grad():
+            stock.markov_head.rnn_proj.weight.zero_()
+            stock.markov_head.hidden_out.weight.zero_()
+            stock.lm_head.weight.copy_(bf16([[1, 2]]))
+        artifact = self.artifact("markov-lora", {
+            "rnn_proj.a": bf16([[1, 1]]), "rnn_proj.b": bf16([[1], [2]]),
+            "hidden_out.a": bf16([[1]]), "hidden_out.b": bf16([[2], [4]]),
+        })
+        merged = variants.build_batch_head(artifact, stock, None)
+        self.assertIs(merged.embed_tokens, stock.embed_tokens)
+        self.assertIs(merged.lm_head, stock.lm_head)
+        self.assertIs(merged._f_rnn_buf, stock._f_rnn_buf)
+        self.assertIs(merged.markov_head._gather_logits.__self__, merged)
+        self.assertNotEqual(merged.markov_head.rnn_proj.weight.data_ptr(),
+                            stock.markov_head.rnn_proj.weight.data_ptr())
+        self.assertTrue(torch.equal(merged.markov_head.rnn_proj.weight, bf16([[1, 1], [2, 2]])))
+        self.assertTrue(torch.equal(merged.markov_head.fold, bf16([[5]])))
+        self.assertTrue(torch.equal(stock.markov_head.rnn_proj.weight, bf16([[0, 0], [0, 0]])))
+        self.assertTrue(torch.equal(stock.markov_head.fold, bf16([[0]])))
+
+    def test_native_head_rejects_incompatible_shared_prefix(self):
+        ctx = "layers.0.self_attn.k_proj_ctx.weight"
+        proposal = "markov_head.rnn_proj.weight"
+        stock_path = self.path.with_name("stock.safetensors")
+        save_file({ctx: bf16([[1]]), proposal: bf16([[0]])}, stock_path)
+        for context_value in (1, 2):
+            save_file({ctx: bf16([[context_value]]), proposal: bf16([[3]])}, self.path)
+            with safe_open(self.path, framework="pt", device="cpu") as source, \
+                 safe_open(stock_path, framework="pt", device="cpu") as stock:
+                if context_value == 1:
+                    loaded = dict(variants.native_head_tensors(source, stock))
+                    self.assertTrue(torch.equal(loaded[proposal], bf16([[3]])))
+                else:
+                    with self.assertRaisesRegex(ValueError, "changes shared prefix state"):
+                        dict(variants.native_head_tensors(source, stock))
 
 
 if __name__ == "__main__":
