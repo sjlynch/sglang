@@ -90,6 +90,22 @@ class ThinkingVariantTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "digest mismatch"):
             variants.ThinkingVariant(artifact, self.model, 4)
 
+    def test_resident_mask_copy_keeps_padding_clear(self):
+        runtime = variants.ThinkingVariant.__new__(variants.ThinkingVariant)
+        runtime.init_mask(4, 'cpu')
+        runtime.mask_patterns = torch.tensor(
+            [[bool(bits & (1 << row)) for row in range(4)] for bits in range(16)],
+        )
+        pointer = runtime.mask.data_ptr()
+        runtime.stage((True, False, True, True))
+        runtime.stage((False, True))
+        self.assertEqual(pointer, runtime.mask.data_ptr())
+        self.assertEqual(runtime.mask[:, 0].tolist(), [False, True, False, False])
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, 'larger than its captured batch'):
+                runtime.stage((True,) * 5)
+        self.assertEqual(runtime.mask[:, 0].tolist(), [False, True, False, False])
+
 
 if __name__ == "__main__":
     unittest.main()

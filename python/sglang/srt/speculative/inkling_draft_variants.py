@@ -54,8 +54,7 @@ class ThinkingVariant:
     def __init__(self, artifact, model, max_bs):
         head = model.markov_head
         lm_head = model.lm_head.weight
-        self.mask = torch.zeros(max_bs, 1, dtype=torch.bool, device=lm_head.device)
-        self.last_mask = None
+        self.init_mask(max_bs, lm_head.device)
         self.recurrent = self.output = None
         self.low_rank = artifact.kind == "markov-lora"
         verify_file(artifact.path, artifact.sha256)
@@ -102,30 +101,57 @@ class ThinkingVariant:
         logger.info("Loaded resident Inkling thinking variant (%s): sha256=%s",
                     artifact.kind, artifact.sha256)
 
-    def stage(self, variants):
-        if variants != self.last_mask:
-            self.last_mask = variants
-            padded = list(variants) + [False] * (len(self.mask) - len(variants))
-            self.mask[:, 0].copy_(
-                async_h2d(padded, dtype=torch.bool, device=self.mask.device)
+    def init_mask(self, max_bs, device):
+        self.mask = torch.zeros(max_bs, 1, dtype=torch.bool, device=device)
+        self.last_mask = None
+        self.mask_patterns = None
+        if self.mask.is_cuda and max_bs <= 8:
+            # The indexed view and copy stay on device. The destination address is fixed for graph replay.
+            self.mask_patterns = torch.tensor(
+                [[bool(bits & (1 << row)) for row in range(max_bs)] for bits in range(1 << max_bs)],
+                dtype=torch.bool, device=device,
             )
+
+    def stage(self, variants):
+        variants = tuple(variants)
+        if variants != self.last_mask:
+            if len(variants) > len(self.mask):
+                raise ValueError("Inkling drafter mask is larger than its captured batch")
+            if self.mask_patterns is not None:
+                bits = sum((1 << row) for row, selected in enumerate(variants) if selected)
+                self.mask[:, 0].copy_(self.mask_patterns[bits], non_blocking=True)
+            else:
+                padded = list(variants) + [False] * (len(self.mask) - len(variants))
+                self.mask[:, 0].copy_(
+                    async_h2d(padded, dtype=torch.bool, device=self.mask.device)
+                )
+            self.last_mask = variants
 
     def recurrent_projection(self, inputs, stock):
         if self.recurrent is None:
             return stock
         a, b = self.recurrent
         if self.low_rank:
-            tuned = stock + F.linear(F.linear(inputs, a), b)
-        else:
-            tuned = F.linear(inputs, a, b)
-        return torch.where(self.mask[:len(stock)], tuned, stock)
+            return self._apply_lora(inputs, a, b, stock)
+        return torch.where(self.mask[:len(stock)], F.linear(inputs, a, b), stock)
 
     def output_projection(self, latent, stock):
         if self.output is None:
             return stock
         a, b = self.output
         if self.low_rank:
-            tuned = stock + F.linear(F.linear(latent, a), b)
-        else:
-            tuned = F.linear(latent, a, b)
+            return self._apply_lora(latent, a, b, stock)
+        return torch.where(self.mask[:len(stock)], F.linear(latent, a, b), stock)
+
+    def _apply_lora(self, inputs, a, b, stock):
+        if (
+            stock.is_cuda and stock.dtype == inputs.dtype == a.dtype == b.dtype == torch.bfloat16
+            and stock.ndim == inputs.ndim == 2 and 0 < len(stock) == len(inputs) <= len(self.mask)
+            and a.shape[0] <= 32 and a.shape[1] <= 8192
+            and all(tensor.is_contiguous() for tensor in (inputs, a, b, stock))
+        ):
+            from sglang.srt.speculative.inkling_draft_variant_kernels import lora_projection
+
+            return lora_projection(inputs, a, b, stock, self.mask)
+        tuned = stock + F.linear(F.linear(inputs, a), b)
         return torch.where(self.mask[:len(stock)], tuned, stock)
