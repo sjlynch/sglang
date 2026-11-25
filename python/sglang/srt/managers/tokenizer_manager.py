@@ -3250,6 +3250,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         """Accumulate metadata; subclasses may use finish_reason for terminal data."""
         for key, values in customized_info.items():
+            if key == "inkling_draft_phases":
+                # Terminal request summary, independent of the token offsets.
+                if finish_reason is not None and values[index]:
+                    meta_info[key] = values[index][0]
+                continue
             self._accumulate_request_meta_info(
                 meta_info,
                 state,
