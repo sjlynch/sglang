@@ -197,13 +197,17 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         policy = self.inkling_draft_policy
         if policy is None or not batch.forward_mode.is_decode() or batch.is_extend_in_batch:
             return super().forward_batch_generation(batch, on_publish, grammar_barrier, **kwargs)
-        width, phases, variants = select_round(policy, batch.reqs, batch._inkling_draft_queue)
+        suffix_stats = [] if policy.anchor_suffix_width8 else None
+        width, phases, variants = select_round(
+            policy, batch.reqs, batch._inkling_draft_queue, suffix_stats
+        )
         resident = self.draft_model.markov_head.thinking_variant
         if resident is not None:
             resident.stage(variants)
         worker = self._width_workers[width]
         result = worker._forward_decode(batch, on_publish, grammar_barrier)
         result.inkling_draft_route = phases, variants
+        result.inkling_suffix_stats = suffix_stats
         return result
 
     def _on_prefill_target_hidden(self, batch, target_hidden):

@@ -35,6 +35,45 @@ def config(artifact=True):
 
 
 class DraftPolicyTests(unittest.TestCase):
+    def test_suffix_uses_prompt_and_commits_only(self):
+        rules = policy.DraftPolicy(
+            (policy.WidthTier(None, 4, 4),), "a" * 64, anchor_suffix_width8=True
+        )
+        self.assertEqual(rules.capture_widths, (4, 8))
+        req = request((1, 2, 3, 4, 99, policy.THINK_START))
+        req.output_ids = [1, 2, 3]
+        self.assertEqual(policy.select_round(rules, [req], 0)[0], 4)
+        req.output_ids.append(4)
+        observations = []
+        self.assertEqual(policy.select_round(rules, [req], 0, observations)[0], 8)
+        self.assertTrue(observations[0][0])
+        self.assertEqual(policy.select_round(rules, [req, request()], 0)[0], 4)
+        req.output_ids += [policy.THINK_END, 1, 2, 3, 4]
+        observations.clear()
+        self.assertEqual(policy.select_round(rules, [req], 0, observations)[0], 4)
+        self.assertEqual(observations, [None])
+
+    def test_suffix_excludes_current_occurrence_and_handles_rewind(self):
+        req = request(output=(1, 2, 3, 4))
+        matcher = policy.AnchorSuffixMatch()
+        self.assertFalse(matcher.update(req))
+        req.output_ids += [5, 1, 2, 3, 4]
+        self.assertTrue(matcher.update(req))
+        req.output_ids = [1, 2, 3, 4]
+        self.assertFalse(matcher.update(req))
+        req.output_ids = [4, 4, 4, 4, 4]
+        matcher = policy.AnchorSuffixMatch()
+        self.assertTrue(matcher.update(req))
+
+    def test_suffix_telemetry_reports_matches_held_to_width_four(self):
+        req = request()
+        policy.record_round(req, True, False, 3, 0, (True, 7))
+        policy.record_round(req, True, False, 7, 6, (True, 11))
+        policy.record_round(req, True, False, 3, 2, (False, 5))
+        summary = policy.telemetry(req)["thinking"]["stock"]["anchor_suffix"]
+        self.assertEqual(summary, {"checks": 3, "matches": 2,
+                                   "matches_at_width8": 1, "cpu_ns": 23})
+
     def test_prompt_and_only_new_committed_tokens_drive_phase(self):
         req = request((policy.THINK_START, 123), (456,))
         self.assertEqual(policy.select_round(config(), [req], 0), (6, (True,), (True,)))
@@ -106,6 +145,10 @@ class DraftPolicyTests(unittest.TestCase):
                 )), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     policy.DraftPolicy.read(path)
+            for flag in ("true", True):
+                path.write_text(json.dumps(dict(manifest, anchor_suffix_width8=flag)), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    policy.DraftPolicy.read(path)
 
 
 def bench(rounds=100_000):
@@ -134,7 +177,37 @@ def bench(rounds=100_000):
     return p99 < 200_000
 
 
+def bench_suffix(rounds=20_000):
+    passed = True
+    for offered in (1, 4, 8):
+        active = min(offered, 4)
+        rules = policy.DraftPolicy(
+            (policy.WidthTier(None, 4, 4),), "a" * 64, anchor_suffix_width8=True
+        )
+        prompt = list(range(32_768)) + [policy.THINK_START]
+        batch = [request(prompt) for _ in range(active)]
+        stats = []
+        policy.select_round(rules, batch, offered - active, stats)
+        cold_us = sum(elapsed for _, elapsed in stats) / 1000
+        samples = []
+        for i in range(rounds):
+            for req in batch:
+                req.output_ids.extend([i % 256, 1, 2, 3])
+            stats.clear()
+            start = time.perf_counter_ns()
+            policy.select_round(rules, batch, offered - active, stats)
+            samples.append(time.perf_counter_ns() - start)
+        samples.sort()
+        p99 = samples[int(rounds * .99)] / 1000
+        print(f"c{offered} ({active} active): first 32K indexing={cold_us:.1f} us, "
+              f"steady p50={median(samples) / 1000:.2f} us p99={p99:.2f} us ({rounds} rounds)")
+        passed &= p99 < 200
+    return passed
+
+
 if __name__ == "__main__":
     if "--bench" in sys.argv:
         sys.exit(0 if bench() else 1)
+    if "--bench-suffix" in sys.argv:
+        sys.exit(0 if bench_suffix() else 1)
     unittest.main()
