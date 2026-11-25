@@ -35,6 +35,32 @@ def config(artifact=True):
 
 
 class DraftPolicyTests(unittest.TestCase):
+    def test_context_load_table_and_structured_answer(self):
+        rules = policy.DraftPolicy(
+            (
+                policy.WidthTier(2, 6, 8, 8192, 8),
+                policy.WidthTier(4, 5, 8, 8192, 8),
+                policy.WidthTier(None, 4, 4, 131072, 8, 8, False),
+            ),
+            "a" * 64, anchor_suffix_width8=True,
+        )
+        self.assertEqual(rules.capture_widths, (4, 5, 6, 8))
+        for load, tokens, expected in (
+            (1, 8191, 6), (2, 8192, 8), (4, 8191, 5), (4, 8192, 8),
+            (8, 131071, 4), (8, 131072, 8),
+        ):
+            req = request([0] * (tokens - 1) + [policy.THINK_START])
+            self.assertEqual(policy.select_round(rules, [req], load - 1)[0], expected)
+        repeats = request((1, 2, 3, 4, 99, policy.THINK_START), (1, 2, 3, 4))
+        self.assertEqual(policy.select_round(rules, [repeats], 3)[0], 8)
+        self.assertEqual(policy.select_round(rules, [repeats], 7)[0], 4)
+        self.assertEqual(policy.select_round(rules, [request()], 3)[0], 8)
+        self.assertEqual(policy.select_round(rules, [request()], 7)[0], 4)
+        self.assertEqual(policy.select_round(rules, [request((200049, 7))], 7)[0], 8)
+        schema_req = request()
+        schema_req.grammar = object()
+        self.assertEqual(policy.select_round(rules, [schema_req], 7)[0], 8)
+
     def test_suffix_uses_prompt_and_commits_only(self):
         rules = policy.DraftPolicy(
             (policy.WidthTier(None, 4, 4),), "a" * 64, anchor_suffix_width8=True
@@ -138,14 +164,15 @@ class DraftPolicyTests(unittest.TestCase):
             self.assertEqual(policy.DraftPolicy.read(path, digest).capture_widths, (4, 6, 8))
             with self.assertRaisesRegex(ValueError, "digest mismatch"):
                 policy.DraftPolicy.read(path, "0" * 64)
-            for change in ({"max_load": None}, {"thinking": 5}, {"answer": True}):
+            for change in ({"max_load": None}, {"thinking": 7}, {"answer": True},
+                           {"thinking_long": 8}, {"long_context_tokens": 0, "thinking_long": 8}):
                 path.write_text(json.dumps(dict(
                     manifest, widths=[dict(manifest["widths"][0], **change),
                                      manifest["widths"][1]]
                 )), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     policy.DraftPolicy.read(path)
-            for flag in ("true", True):
+            for flag in ("true", 1):
                 path.write_text(json.dumps(dict(manifest, anchor_suffix_width8=flag)), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     policy.DraftPolicy.read(path)

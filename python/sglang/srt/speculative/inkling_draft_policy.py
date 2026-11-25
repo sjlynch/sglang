@@ -18,9 +18,9 @@ THINK_END = 200010
 OTHER_CHANNELS = frozenset(
     (200000, 200001, 200002, 200003, 200004, 200006, 200022, 200024, 200049, 200057)
 )
-PHASE_TRANSITIONS = dict.fromkeys(OTHER_CHANNELS | {THINK_END}, False)
-PHASE_TRANSITIONS[THINK_START] = True
-WIDTHS = (4, 6, 8)  # Includes the target anchor.
+CHANNELS = dict.fromkeys(OTHER_CHANNELS | {THINK_END}, "answer")
+CHANNELS.update({THINK_START: "thinking", 200049: "tool", 200057: "tool"})
+WIDTHS = (4, 5, 6, 8)  # Includes the target anchor.
 
 
 def sha256_field(value):
@@ -41,6 +41,13 @@ class WidthTier:
     max_load: int | None
     thinking: int
     answer: int
+    long_context_tokens: int | None = None
+    thinking_long: int | None = None
+    answer_structured: int | None = None
+    suffix_short: bool = True
+
+    def is_long(self, prompt_tokens):
+        return self.long_context_tokens is not None and prompt_tokens >= self.long_context_tokens
 
 
 @dataclass(frozen=True)
@@ -52,22 +59,20 @@ class DraftPolicy:
 
     @property
     def capture_widths(self):
-        widths = {width for tier in self.widths for width in (tier.thinking, tier.answer)}
+        widths = {
+            width for tier in self.widths
+            for width in (tier.thinking, tier.answer, tier.thinking_long, tier.answer_structured)
+            if width is not None
+        }
         if self.anchor_suffix_width8:
             widths.add(8)
         return tuple(sorted(widths))
 
-    def width(self, active, queued, phases, suffix_hits=()):
+    def tier(self, active, queued):
         load = active + queued
         for tier in self.widths:
             if tier.max_load is None or load <= tier.max_load:
-                # Keep a single native rectangular verify graph for the round.
-                if not suffix_hits:
-                    return min(tier.thinking if thinking else tier.answer for thinking in phases)
-                return min(
-                    (8 if hit else tier.thinking) if thinking else tier.answer
-                    for thinking, hit in zip(phases, suffix_hits, strict=True)
-                )
+                return tier
         raise AssertionError("Width policy has no final tier")
 
     @classmethod
@@ -89,7 +94,9 @@ class DraftPolicy:
         widths = []
         previous = 0
         for i, row in enumerate(rows):
-            if not isinstance(row, dict) or row.keys() != {"max_load", "thinking", "answer"}:
+            required = {"max_load", "thinking", "answer"}
+            optional = {"long_context_tokens", "thinking_long", "answer_structured", "suffix_short"}
+            if not isinstance(row, dict) or not required <= row.keys() or row.keys() - required - optional:
                 raise ValueError("Each width tier requires max_load, thinking and answer")
             limit = row["max_load"]
             if i == len(rows) - 1:
@@ -99,13 +106,20 @@ class DraftPolicy:
                 raise ValueError("Width tier limits must be positive and strictly increasing")
             else:
                 previous = limit
-            for phase in ("thinking", "answer"):
-                if type(row[phase]) is not int or row[phase] not in WIDTHS:
+            for phase in ("thinking", "answer", "thinking_long", "answer_structured"):
+                if phase in row and (type(row[phase]) is not int or row[phase] not in WIDTHS):
                     raise ValueError(f"Draft width must be one of {WIDTHS}")
+            threshold = row.get("long_context_tokens")
+            if ("long_context_tokens" in row) != ("thinking_long" in row) or (
+                "long_context_tokens" in row and (type(threshold) is not int or threshold <= 0)
+            ):
+                raise ValueError("Long thinking width requires a positive long_context_tokens threshold")
+            if type(row.get("suffix_short", True)) is not bool:
+                raise ValueError("suffix_short must be a boolean")
             widths.append(WidthTier(**row))
         suffix_flag = payload.get("anchor_suffix_width8", False)
-        if type(suffix_flag) is not bool or (suffix_flag and any(row.answer != 4 for row in widths)):
-            raise ValueError("The anchor suffix flag is boolean and requires answer width 4")
+        if type(suffix_flag) is not bool:
+            raise ValueError("The anchor suffix flag must be boolean")
         artifact = None
         if "thinking" in payload:
             row = payload["thinking"]
@@ -137,17 +151,17 @@ def validate_override(custom_params, policy):
         raise ValueError("inkling_draft_variant requires an enabled variant (auto, stock, thinking)")
 
 
-def phase_after(tokens, thinking=False):
+def channel_after(tokens, channel="answer"):
     for token in reversed(tokens):
-        transition = PHASE_TRANSITIONS.get(token)
+        transition = CHANNELS.get(token)
         if transition is not None:
             return transition
-    return thinking
+    return channel
 
 
 @dataclass
 class RequestPhase:
-    thinking: bool = False
+    channel: str = "answer"
     seen: int = 0
     override: str = "auto"
 
@@ -155,23 +169,23 @@ class RequestPhase:
     def from_request(cls, req):
         custom_params = req.sampling_params.custom_params or {}
         return cls(
-            thinking=phase_after(req.origin_input_ids),
+            channel=channel_after(req.origin_input_ids),
             override=custom_params.get("inkling_draft_variant", "auto"),
         )
 
     def update(self, req):
         output = req.output_ids
         if len(output) < self.seen:
-            self.thinking = phase_after(req.origin_input_ids)
+            self.channel = channel_after(req.origin_input_ids)
             self.seen = 0
         if self.seen < len(output):
-            self.thinking = phase_after(output[self.seen:], self.thinking)
+            self.channel = channel_after(output[self.seen:], self.channel)
             self.seen = len(output)
-        return self.thinking
+        return self.channel == "thinking"
 
     def variant(self, thinking_variant_loaded):
         return thinking_variant_loaded and (
-            self.override == "thinking" or (self.override == "auto" and self.thinking)
+            self.override == "thinking" or (self.override == "auto" and self.channel == "thinking")
         )
 
 
@@ -211,7 +225,8 @@ class AnchorSuffixMatch:
 
 def select_round(policy, requests, queued, suffix_stats=None):
     phases, variants = [], []
-    suffix_hits = []
+    widths = []
+    tier = policy.tier(len(requests), queued)
     for req in requests:
         state = getattr(req, "_inkling_draft_phase", None)
         if state is None:
@@ -219,20 +234,27 @@ def select_round(policy, requests, queued, suffix_stats=None):
         thinking = state.update(req)
         phases.append(thinking)
         variants.append(state.variant(policy.thinking is not None))
-        if policy.anchor_suffix_width8:
-            hit = False
-            observation = None
-            if thinking:
+        observation = None
+        if thinking:
+            long_prompt = tier.is_long(len(req.origin_input_ids))
+            width = tier.thinking_long if long_prompt else tier.thinking
+            if policy.anchor_suffix_width8 and width < 8 and (long_prompt or tier.suffix_short):
                 start = perf_counter_ns()
                 matcher = getattr(req, "_inkling_anchor_suffix", None)
                 if matcher is None:
                     matcher = req._inkling_anchor_suffix = AnchorSuffixMatch()
                 hit = matcher.update(req)
                 observation = (hit, perf_counter_ns() - start)
-            suffix_hits.append(hit)
-            if suffix_stats is not None:
-                suffix_stats.append(observation)
-    return policy.width(len(requests), queued, phases, suffix_hits), tuple(phases), tuple(variants)
+                if hit:
+                    width = 8
+        else:
+            structured = state.channel == "tool" or getattr(req, "grammar", None) is not None
+            width = tier.answer_structured if structured and tier.answer_structured is not None else tier.answer
+        widths.append(width)
+        if suffix_stats is not None:
+            suffix_stats.append(observation)
+    # One native rectangular graph must fit every request in the round.
+    return min(widths), tuple(phases), tuple(variants)
 
 
 @dataclass
