@@ -1,6 +1,7 @@
 """Standalone CPU checks and c4 routing micro-benchmark (no SGLang imports)."""
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 from statistics import median
@@ -94,7 +95,10 @@ class DraftPolicyTests(unittest.TestCase):
                 ],
             }
             path.write_text(json.dumps(manifest), encoding="utf-8")
-            self.assertEqual(policy.DraftPolicy.read(path).capture_widths, (4, 6, 8))
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(policy.DraftPolicy.read(path, digest).capture_widths, (4, 6, 8))
+            with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                policy.DraftPolicy.read(path, "0" * 64)
             for change in ({"max_load": None}, {"thinking": 5}, {"answer": True}):
                 path.write_text(json.dumps(dict(
                     manifest, widths=[dict(manifest["widths"][0], **change),

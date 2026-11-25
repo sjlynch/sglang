@@ -1,5 +1,6 @@
 """Host-side policy for the opt-in Inkling DSpark experiment."""
 
+import hashlib
 import json
 import os
 import re
@@ -7,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DRAFT_MANIFEST_ENV = "SGLANG_INKLING_DRAFT_MANIFEST"
+DRAFT_MANIFEST_SHA_ENV = DRAFT_MANIFEST_ENV + "_SHA256"
 # Inkling chat framing (inkling_tokenizer.SPECIAL_TOKEN_IDS).
 THINK_START = 200008
 THINK_END = 200010
@@ -60,8 +62,11 @@ class DraftPolicy:
         raise AssertionError("Width policy has no final tier")
 
     @classmethod
-    def read(cls, path):
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    def read(cls, path, sha256=None):
+        data = Path(path).read_bytes()
+        if sha256 is not None and hashlib.sha256(data).hexdigest() != sha256_field(sha256):
+            raise ValueError("Inkling drafter manifest digest mismatch")
+        payload = json.loads(data)
         if (
             not isinstance(payload, dict)
             or payload.keys() - {"version", "stock_sha256", "thinking", "widths"}
@@ -106,7 +111,7 @@ class DraftPolicy:
     @classmethod
     def from_environment(cls):
         filename = os.environ.get(DRAFT_MANIFEST_ENV)
-        return cls.read(filename) if filename else None
+        return cls.read(filename, sha256_field(os.environ.get(DRAFT_MANIFEST_SHA_ENV))) if filename else None
 
 
 def validate_override(custom_params, policy):
