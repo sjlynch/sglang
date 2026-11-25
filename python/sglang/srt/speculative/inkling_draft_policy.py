@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+from functools import lru_cache
 from itertools import islice
 from time import perf_counter_ns
 from dataclasses import dataclass, field, replace
@@ -22,6 +23,12 @@ CHANNELS = dict.fromkeys(OTHER_CHANNELS | {THINK_END}, "answer")
 CHANNELS.update({THINK_START: "thinking", 200049: "tool", 200057: "tool"})
 WIDTHS = (4, 5, 6, 8)  # Includes the target anchor.
 BATCH_MODES = ("control", "width", "head", "both")
+# Pilot costs from the held-out-calibrated policy simulator (ms, w4/5/6/8).
+SWARM_ROUND_MS = ((10.8, 11.35, 11.9, 12.9), (13.3, 13.95, 14.6, 16.3),
+                  (14.95, 15.95, 16.95, 18.5), (16.6, 17.95, 19.3, 20.7))
+TRACKED_ALPHA = (0.764, 0.697, 0.684, 0.700, 0.703, 0.710, 0.699)
+CONTEXT_MS_PER_TOKEN = 0.0000332
+ALPHA_WINDOW = 16
 
 
 def sha256_field(value):
@@ -61,11 +68,14 @@ class DraftPolicy:
     # Diagnostic: (head, width) every decode round uses while the mode's full graph
     # table is still captured. Isolates one captured graph for identity tests.
     pin: tuple[int, int] | None = None
+    acceptance_tracking: bool = False
 
     @property
     def capture_widths(self):
         if self.batch_mode in ("control", "head"):
             return (4,)
+        if self.acceptance_tracking:
+            return WIDTHS
         widths = {
             width for tier in self.widths
             for width in (tier.thinking, tier.answer, tier.thinking_long, tier.answer_structured)
@@ -96,7 +106,7 @@ class DraftPolicy:
         payload = json.loads(data)
         if (
             not isinstance(payload, dict)
-            or payload.keys() - {"version", "stock_sha256", "thinking", "widths", "anchor_suffix_width8", "batch_mode", "pin"}
+            or payload.keys() - {"version", "stock_sha256", "thinking", "widths", "anchor_suffix_width8", "batch_mode", "pin", "acceptance_tracking"}
             or type(payload.get("version")) is not int
             or payload["version"] != 1
         ):
@@ -154,7 +164,11 @@ class DraftPolicy:
             raise ValueError("Batch head switching requires a resident thinking artifact")
         if artifact and artifact.kind == "native-head" and batch_mode is None:
             raise ValueError("A native head requires batch routing")
-        policy = cls(tuple(widths), sha256_field(payload.get("stock_sha256")), artifact, suffix_flag, batch_mode)
+        tracking = payload.get("acceptance_tracking", False)
+        if type(tracking) is not bool or (tracking and batch_mode not in ("width", "both")):
+            raise ValueError("Acceptance tracking requires an overlap width arm")
+        policy = cls(tuple(widths), sha256_field(payload.get("stock_sha256")), artifact,
+                     suffix_flag, batch_mode, acceptance_tracking=tracking)
         if "pin" in payload:
             row = payload["pin"]
             if (
@@ -199,6 +213,9 @@ class RequestPhase:
     channel: str = "answer"
     seen: int = 0
     override: str = "auto"
+    acceptance_rounds: int = 0
+    ewma_accepted: float = 0
+    ewma_reached: float = 0
 
     @classmethod
     def from_request(cls, req):
@@ -222,6 +239,18 @@ class RequestPhase:
         return thinking_variant_loaded and (
             self.override == "thinking" or (self.override == "auto" and self.channel == "thinking")
         )
+
+    def observe_acceptance(self, drafted, accepted):
+        accepted = min(drafted, max(0, accepted))
+        reached = min(drafted, accepted + 1)
+        if reached:
+            decay = (ALPHA_WINDOW - 1) / (ALPHA_WINDOW + 1)
+            self.ewma_accepted = self.ewma_accepted * decay + accepted
+            self.ewma_reached = self.ewma_reached * decay + reached
+            self.acceptance_rounds += 1
+
+    def alpha(self):
+        return self.ewma_accepted / self.ewma_reached if self.acceptance_rounds >= ALPHA_WINDOW else 0.70
 
 
 @dataclass
@@ -323,6 +352,61 @@ def select_round(policy, requests, queued, suffix_stats=None, completed_channels
     return min(widths), tuple(phases), tuple(variants)
 
 
+def _expectations(alpha):
+    # Retain the measured depth profile after shifting its mean to the observed alpha.
+    if alpha <= 0 or alpha >= 1:
+        return tuple(1.0 + alpha * (width - 1) for width in WIDTHS)
+    odds = tuple(p / (1 - p) for p in TRACKED_ALPHA)
+    lo, hi = 0.0, 1000.0
+    for _ in range(23):
+        scale = (lo + hi) / 2
+        probs = tuple(o * scale / (1 + o * scale) for o in odds)
+        if sum(probs) / len(probs) > alpha:
+            hi = scale
+        else:
+            lo = scale
+    total = survival = 1.0
+    scores = [total]
+    for p in probs:
+        survival *= p
+        total += survival
+        scores.append(total)
+    return tuple(scores[width - 1] for width in WIDTHS)
+
+
+@lru_cache(maxsize=1)
+def tracking_expectations():
+    return tuple(_expectations(alpha / 1000) for alpha in range(1001))
+
+
+def _round_costs():
+    scale1 = (10.649 - 1100 * CONTEXT_MS_PER_TOKEN) / SWARM_ROUND_MS[0][0]
+    scale4 = (16.999 - 4400 * CONTEXT_MS_PER_TOKEN) / SWARM_ROUND_MS[3][0]
+    return tuple(
+        tuple((scale1 + row * (scale4 - scale1) / 3)
+              * (times[0] + 1.109 * (time - times[0])) for time in times)
+        for row, times in enumerate(SWARM_ROUND_MS)
+    )
+
+
+ROUND_COSTS = _round_costs()
+
+
+def select_tracking_width(requests, phases):
+    expected = [0.0] * len(WIDTHS)
+    context_tokens = 0
+    lookup = tracking_expectations()
+    for req, thinking in zip(requests, phases):
+        alpha = req._inkling_draft_phase.alpha() if thinking else 0.958
+        for index, value in enumerate(lookup[round(alpha * 1000)]):
+            expected[index] += value
+        context_tokens += len(req.origin_input_ids) + len(req.output_ids)
+    context_cost = context_tokens * CONTEXT_MS_PER_TOKEN
+    costs = ROUND_COSTS[min(len(requests), len(ROUND_COSTS)) - 1]
+    best = max(range(len(WIDTHS)), key=lambda index: expected[index] / (costs[index] + context_cost))
+    return WIDTHS[best]
+
+
 def select_batch_round(policy, requests, queued, completed_channels=None):
     """Choose the next batch from committed host state and scheduler counts."""
     requested_width, phases, _ = select_round(
@@ -332,6 +416,8 @@ def select_batch_round(policy, requests, queued, completed_channels=None):
         # Phases still advance and are reported; only the graph choice is fixed.
         return policy.pin[0], policy.pin[1], phases
     width = requested_width if policy.batch_mode in ("width", "both") else 4
+    if policy.acceptance_tracking:
+        width = select_tracking_width(requests, phases)
     head = int(policy.capture_heads == 2 and 2 * sum(phases) > len(phases))
     return head, width, phases
 
@@ -375,7 +461,9 @@ class DepthCounts:
         return summary
 
 
-def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=None):
+def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=None, *, track_acceptance=False):
+    if track_acceptance and thinking:
+        req._inkling_draft_phase.observe_acceptance(drafted, accepted)
     counts = getattr(req, "_inkling_draft_depth", None)
     if counts is None:
         counts = req._inkling_draft_depth = {}

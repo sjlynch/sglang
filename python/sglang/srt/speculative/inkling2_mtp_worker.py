@@ -23,6 +23,7 @@ from sglang.srt.speculative.inkling_draft_policy import (
     RequestPhase,
     select_batch_round,
     select_round,
+    tracking_expectations,
 )
 from sglang.srt.utils.device import async_h2d
 
@@ -171,6 +172,8 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             return
         self._assert_native_graphs()
         if policy.batch_mode is not None:
+            if policy.acceptance_tracking:
+                tracking_expectations()
             widths = policy.capture_widths
             self._batch_width_index = {width: i for i, width in enumerate(widths)}
             self._batch_workers = tuple(
@@ -254,6 +257,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             with get_spec().override(speculative_num_draft_tokens=width):
                 result = worker._forward_decode(batch, on_publish, grammar_barrier)
             result.inkling_draft_route = phases, (bool(head),) * len(phases)
+            result.inkling_track_acceptance = policy.acceptance_tracking
             return result
         suffix_stats = [] if policy.anchor_suffix_width8 else None
         width, phases, variants = select_round(

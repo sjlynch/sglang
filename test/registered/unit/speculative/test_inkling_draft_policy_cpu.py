@@ -36,6 +36,35 @@ def config(artifact=True):
 
 
 class DraftPolicyTests(unittest.TestCase):
+    def test_tracking_uses_accepted_over_reached_and_ignores_queue_pressure(self):
+        rules = replace(config(False), batch_mode="width", acceptance_tracking=True)
+        reqs = [request((policy.THINK_START,)) for _ in range(4)]
+        self.assertEqual(rules.capture_widths, (4, 5, 6, 8))
+        self.assertEqual(policy.select_batch_round(rules, reqs[:1], 0)[1], 6)
+        self.assertEqual(policy.select_batch_round(rules, reqs, 4)[1], 5)
+        for _ in range(16):
+            for req in reqs:
+                policy.record_round(req, True, False, 4, 3, track_acceptance=True)
+        self.assertAlmostEqual(reqs[0]._inkling_draft_phase.alpha(), 0.75)
+        self.assertEqual(policy.select_batch_round(rules, reqs, 0)[1], 8)
+        self.assertEqual(policy.select_batch_round(rules, reqs, 4)[1], 8)
+        for _ in range(32):
+            for req in reqs:
+                policy.record_round(req, True, False, 3, 0, track_acceptance=True)
+        self.assertEqual(policy.select_batch_round(rules, reqs, 0)[1], 4)
+        for req in reqs:
+            req.output_ids.append(policy.THINK_END)
+        self.assertEqual(policy.select_batch_round(rules, reqs, 4)[1], 8)
+
+    def test_tracking_joint_batch_argmax_can_widen_a_mixed_batch(self):
+        rules = replace(config(False), batch_mode="width", acceptance_tracking=True)
+        reqs = [request((policy.THINK_START,)), request()]
+        policy.select_batch_round(rules, reqs, 0)
+        for _ in range(16):
+            policy.record_round(reqs[0], True, False, 3, 0, track_acceptance=True)
+        self.assertEqual(policy.select_batch_round(rules, reqs[:1], 0)[1], 4)
+        self.assertEqual(policy.select_batch_round(rules, reqs, 0)[1], 8)
+
     def test_overlap_factorial_modes_and_queue_pressure(self):
         base = config()
         reqs = [request((policy.THINK_START,)) for _ in range(2)]

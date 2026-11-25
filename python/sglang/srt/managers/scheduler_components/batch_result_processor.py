@@ -1035,6 +1035,7 @@ class SchedulerBatchResultProcessor:
                         req, phases[i], variants[i], stride - num_non_draft,
                         num_correct_drafts,
                         None if result.inkling_suffix_stats is None else result.inkling_suffix_stats[i],
+                        track_acceptance=result.inkling_track_acceptance,
                     )
 
                 if block_accept_lens is not None:

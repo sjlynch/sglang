@@ -154,6 +154,7 @@ class GenerationBatchResult:
     speculative_output_stride: Optional[int] = None
     # Inkling round-start phase and resident-variant mask in batch row order.
     inkling_draft_route: Optional[tuple[tuple[bool, ...], tuple[bool, ...]]] = None
+    inkling_track_acceptance: bool = False
     inkling_suffix_stats: Optional[list[Optional[tuple[bool, int]]]] = None
     # Valid output tokens that are not accepted draft proposals. Existing
     # algorithms have one bonus token; UNO also emits its clean root.
