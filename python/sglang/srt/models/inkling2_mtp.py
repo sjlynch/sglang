@@ -146,6 +146,15 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             requires_grad=False,
         )
         self.mask_embed = nn.Parameter(torch.zeros(hidden), requires_grad=False)
+        # Research K2 (SGLANG_INKLING2_MTP_BLOCK_ARCH tap_fc): full-rank residual
+        # fusion of the per-visit taps, added to every scalar mix before its norm.
+        self.tap_fc = (
+            nn.Linear(self.num_context_features * hidden, hidden, bias=False)
+            if getattr(config, "mtp_tap_fc", False)
+            else None
+        )
+        if self.tap_fc is not None:
+            self.tap_fc.weight.requires_grad_(False)
         self._fuse_alpha = None
         self._f_rnn_rows = None
         self._f_rnn_buf = None
@@ -235,10 +244,26 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
                 "MTP request pool changed after recurrent state allocation"
             )
 
-    def _mix_norm(self, targets, row, norm):
+    def _tap_term(self, targets):
+        """K2: tap_fc(concat_i rms(f_i)) in FP32 [N, hidden], or None for the shipped head."""
+        if self.tap_fc is None:
+            return None
+        f = targets.float()
+        f = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + 1e-6)
+        return self.tap_fc(f.flatten(1).to(self.tap_fc.weight.dtype)).float()
+
+    def _mix_norm(self, targets, row, norm, tap=None):
         assert self._fuse_alpha is not None
-        alpha = self._fuse_alpha[row].to(targets.dtype)
-        return mix_rmsnorm(targets, alpha, norm.weight, norm.variance_epsilon)
+        if tap is None:
+            alpha = self._fuse_alpha[row].to(targets.dtype)
+            return mix_rmsnorm(targets, alpha, norm.weight, norm.variance_epsilon)
+        # Unfused K2 path, as the trainer (drafter.py mix): FP32 sum, norm, one rounding.
+        alpha = torch.softmax(self.fuse_weight.float(), dim=-1)[row]
+        mixed = (targets.float() * alpha[None, :, None]).sum(1) + tap
+        mixed = mixed * torch.rsqrt(
+            mixed.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon
+        )
+        return (mixed * norm.weight.float()).to(targets.dtype)
 
     def compute_f_rnn(self, target_hidden_last):
         targets = target_hidden_last.view(
@@ -246,7 +271,9 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             self.num_context_features,
             self.config.hidden_size,
         )
-        return self._mix_norm(targets, -1, self.markov_head.dflare_norm)
+        return self._mix_norm(
+            targets, -1, self.markov_head.dflare_norm, self._tap_term(targets)
+        )
 
     def store_f_rnn(self, req_pool_indices, target_hidden_rows):
         assert self._f_rnn_buf is not None
@@ -309,9 +336,10 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         if swa_loc is None and isinstance(pool, SWAKVPool):
             # Static verify capture can supply only full-space locations.
             swa_loc = pool.translate_loc_from_full_to_swa(cache_loc)
+        tap = self._tap_term(targets)  # K2: once per position, shared by every layer
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
-            context = self._mix_norm(targets, i, layer.dflare_norm)
+            context = self._mix_norm(targets, i, layer.dflare_norm, tap)
             kv, _ = attn.kv_proj_ctx(context.to(attn.kv_proj_ctx.weight.dtype))
             k, v = kv.split([attn.kv_size, attn.kv_size], dim=-1)
             k = attn.k_norm_ctx(k.reshape(-1, attn.head_dim)).view_as(k)
