@@ -2314,6 +2314,10 @@ class Envs:
     # decode kernel, all draft tokens of a sequence in one launch; changes the
     # softmax reduction order.
     SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL = EnvBool(False)
+    # Research only (Infera BLOCK-DRAFTER.md, K1-K3): the "block_arch" JSON from
+    # an mtp-block.safetensors head (two-tap block convolution, full-rank tap
+    # fusion, extra local layers). Empty (default): the shipped MTP head, unchanged.
+    SGLANG_INKLING2_MTP_BLOCK_ARCH = EnvStr("")
     # Decode and MTP verify attention all-reduce through the push all-reduce
     # (rank-order FP32 sum) instead of the multimem one-shot.
     SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)
