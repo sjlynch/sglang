@@ -2,6 +2,7 @@ import itertools
 import logging
 from copy import copy
 from pathlib import Path
+from time import perf_counter_ns
 
 import torch
 
@@ -21,9 +22,11 @@ from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWork
 from sglang.srt.speculative.inkling_draft_policy import (
     CONTEXT_MS_PER_TOKEN,
     ROUND_COSTS,
+    WIDTHS,
     DraftPolicy,
     RequestPhase,
     p3_shadow_width,
+    qiso_phase_ids,
     select_batch_round,
     select_round,
     tracking_expectations,
@@ -31,6 +34,10 @@ from sglang.srt.speculative.inkling_draft_policy import (
 from sglang.srt.utils.device import async_h2d
 
 logger = logging.getLogger(__name__)
+
+
+def _context_tokens(requests):
+    return sum(len(req.origin_input_ids) + len(req.output_ids) for req in requests)
 
 
 def _worker_view(worker):
@@ -47,6 +54,14 @@ class Inkling2MTPVerifyExecutor(TargetVerifyExecutor):
     def __init__(self, *, draft_model, **kwargs):
         super().__init__(**kwargs)
         self.draft_model = draft_model
+        # perf_counter_ns once the target verify forward (the graph replay) was
+        # launched: the end of a QISO-x dispatch bubble.
+        self.launched_ns = None
+
+    def _forward_prepared_verify(self, **kwargs):
+        result = super()._forward_prepared_verify(**kwargs)
+        self.launched_ns = perf_counter_ns()
+        return result
 
     def commit_hidden(
         self,
@@ -91,6 +106,8 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         self._batch_workers = ()
         self._batch_width_index = {}
         self._qiso_table = self._qiso_rule = None
+        self._qiso_decision = self._qiso_dispatcher = self._qiso_round_log = None
+        self._qiso_shadow_proposal = None
         from sglang.srt.speculative.dspark_components.draft_filter import filtered_draft_enabled
 
         self._filtered_draft = filtered_draft_enabled()
@@ -201,7 +218,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             )
             logger.info("Inkling batch routing captured %d resident heads at widths %s", len(models), widths)
             if self._qiso_table is not None:
-                self._init_qiso_shadow(policy)
+                self._init_qiso(policy)
             return
         for width in policy.capture_widths:
             self._width_workers[width] = (
@@ -209,12 +226,41 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             )
         logger.info("Inkling drafter captured native width set %s", policy.capture_widths)
 
-    def _init_qiso_shadow(self, policy):
-        from sglang.srt.speculative.inkling_width_selector import ExactStopWidth
+    def _init_qiso(self, policy):
+        from sglang.srt.speculative.inkling_width_dispatch import (
+            QisoDecision,
+            QisoDispatcher,
+            QisoRoundLog,
+        )
 
-        self._qiso_rule = ExactStopWidth(self._qiso_table, device=self.device)
-        tracking_expectations()  # the shadow replays P3
+        self._qiso_decision = QisoDecision(
+            self._qiso_table, self.device, ROUND_COSTS, CONTEXT_MS_PER_TOKEN, h2d=async_h2d
+        )
+        self._qiso_rule = self._qiso_decision.rule
         head, width = policy.pin
+        if self._qiso_table.tool_source != "table":
+            logger.warning(
+                "QISO-x table %s has no tool table: tool-call and grammar rows are priced as answers",
+                policy.width_selector.sha256[:12],
+            )
+        if policy.width_selector_mode == "active":
+            missing = set(WIDTHS) - set(self._batch_width_index)
+            if missing:
+                raise ValueError(f"QISO-x active dispatch needs captured verify widths {WIDTHS}")
+            if getattr(getattr(self._observers, "_info_dumper", None), "enabled", False):
+                raise ValueError("QISO-x active dispatch does not support the DSpark info dumper")
+            self._qiso_dispatcher = QisoDispatcher(
+                self._qiso_decision, force_width=policy.width_selector_force
+            )
+            logger.info(
+                "Inkling QISO-x ACTIVE dispatch on (table %s v%d%s): draft at width %d, verify at the device-chosen width",
+                policy.width_selector.sha256[:12], self._qiso_table.version,
+                "" if policy.width_selector_force is None else f", forced width {policy.width_selector_force}",
+                width,
+            )
+            return
+        tracking_expectations()  # the shadow replays P3
+        self._qiso_round_log = QisoRoundLog.from_environment(self.device)
         worker = self._batch_workers[head * len(self._batch_width_index) + self._batch_width_index[width]]
         proposer = worker._proposer
         propose = proposer.propose
@@ -234,36 +280,68 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         copy_done, beside the realized width-8 acceptance."""
         proposal = getattr(worker, "_qiso_last_proposal", None)
         worker._qiso_last_proposal = None
-        if proposal is None or proposal.draft_block.corrected_logits is None:
+        self._qiso_shadow_proposal = proposal
+        if proposal is None:
             return None
-        from sglang.srt.speculative.inkling_width_selector import drafted_confidence
-
         block = proposal.draft_block
         bs = len(batch.reqs)
-        q = drafted_confidence(
-            block.corrected_logits[:bs], block.draft_tokens[:bs], block.temperatures[:bs]
+        # The same decision the active dispatch makes (inkling_width_dispatch.py).
+        width = self._qiso_decision.decide(
+            block, bs, qiso_phase_ids(batch.reqs), _context_tokens(batch.reqs)
         )
-        device = q.device
-        thinking = async_h2d(list(phases), dtype=torch.bool, device=device)
-        context = CONTEXT_MS_PER_TOKEN * sum(
-            len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
-        )
-        costs = ROUND_COSTS[min(bs, len(ROUND_COSTS)) - 1]
-        round_ms = async_h2d([cost + context for cost in costs], dtype=torch.float64, device=device)
-        rule = self._qiso_rule
-        if device.type == "cuda":
-            from sglang.kernels.ops.speculative.qiso_width import qiso_width
-
-            width = torch.empty(1, dtype=torch.int64, device=device)
-            qiso_width(
-                q, thinking, torch.ones(bs, dtype=torch.bool, device=device),
-                rule.iso, rule.prior, rule.answer, round_ms, width,
-            )
-        else:
-            width = rule(q, thinking, round_ms).view(1)
-        host = torch.empty(1, dtype=torch.int64, pin_memory=device.type == "cuda")
+        if width is None:
+            return None
+        host = torch.empty(1, dtype=torch.int64, pin_memory=width.is_cuda)
         host.copy_(width, non_blocking=True)
         return host
+
+    def _qiso_log_round(self, proposal, batch, result):
+        """SGLANG_INKLING_QISO_ROUND_LOG: one width-8 round per row for refitting
+        the phase tables (tool output on agentic panels, a sampling regime)."""
+        if proposal is None:
+            return
+        logits = getattr(result.logits_output, "next_token_logits", None)
+        self._qiso_round_log.record(
+            proposal.draft_block, len(batch.reqs), logits, result.accept_lens,
+            batch.reqs, qiso_phase_ids(batch.reqs),
+        )
+
+    def _qiso_dispatch_round(self, batch, on_publish, grammar_barrier):
+        """QISO-x active: draft with the width-8 graph, decide on the device, read
+        the width once (the bounded sync), verify with that width's graph."""
+        index = self._batch_width_index
+        drafter = self._batch_workers[index[8]]
+        dispatcher = self._qiso_dispatcher
+        bs = len(batch.reqs)
+        phase_ids = qiso_phase_ids(batch.reqs)
+        context = _context_tokens(batch.reqs)
+        round_state = {}
+
+        def after_propose(proposal):
+            width, wait_ns, fallback = dispatcher.read_width(proposal.draft_block, bs, phase_ids, context)
+            round_state.update(width=width, wait_ns=wait_ns, fallback=fallback)
+            worker = drafter if width == 8 else self._batch_workers[index[width]]
+            worker._verify_executor.launched_ns = None
+            round_state["executor"] = worker._verify_executor
+            if width == 8:
+                return None
+            from sglang.srt.speculative.inkling_width_dispatch import slice_proposal
+
+            with get_spec().override(speculative_num_draft_tokens=width):
+                return worker._forward_decode(
+                    batch, on_publish, grammar_barrier, injected_proposal=slice_proposal(proposal, width)
+                )
+
+        with get_spec().override(speculative_num_draft_tokens=8):
+            result = drafter._forward_decode(batch, on_publish, grammar_barrier, after_propose=after_propose)
+        width = round_state.get("width", 8)
+        executor = round_state.get("executor")
+        bubble = dispatcher.bubble_ns(None if executor is None else executor.launched_ns)
+        wait_ns = round_state.get("wait_ns", 0)
+        fallback = round_state.get("fallback", True)
+        dispatcher.stats.note(width, wait_ns, bubble, fallback)
+        result.inkling_qiso_active = (width, wait_ns, bubble, fallback)
+        return result
 
     def _assert_native_graphs(self):
         for runner in (self.model_runner, self.draft_model_runner):
@@ -347,6 +425,11 @@ class Inkling2MTPWorker(DSparkWorkerV2):
                 getattr(batch, "_inkling_draft_completed_channels", None),
             )
             batch._inkling_draft_completed_channels = None
+            if self._qiso_dispatcher is not None:
+                result = self._qiso_dispatch_round(batch, on_publish, grammar_barrier)
+                result.inkling_draft_route = phases, (False,) * len(phases)
+                result.inkling_track_acceptance = False
+                return result
             index = head * len(self._batch_width_index) + self._batch_width_index[width]
             worker = self._batch_workers[index]
             with get_spec().override(speculative_num_draft_tokens=width):
@@ -356,6 +439,9 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             if self._qiso_rule is not None:
                 result.inkling_qiso_shadow = self._qiso_shadow(worker, batch, phases)
                 result.inkling_p3_shadow = p3_shadow_width(batch.reqs, phases)
+                if self._qiso_round_log is not None:
+                    self._qiso_log_round(self._qiso_shadow_proposal, batch, result)
+                self._qiso_shadow_proposal = None
             return result
         suffix_stats = [] if policy.anchor_suffix_width8 else None
         width, phases, variants = select_round(

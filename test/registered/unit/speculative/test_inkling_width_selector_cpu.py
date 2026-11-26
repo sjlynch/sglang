@@ -179,9 +179,9 @@ class GateATests(unittest.TestCase):
             out = torch.zeros(1, dtype=torch.int64, device=device)
             qiso_kernel.qiso_width(
                 torch.tensor(q, dtype=torch.float32, device=device),
-                torch.tensor(thinking, device=device),
+                rule.phase_tensor(torch.tensor(thinking, device=device)),
                 torch.ones(rows, dtype=torch.bool, device=device),
-                rule.iso, rule.prior, rule.answer,
+                rule.iso, rule.prior,
                 ms_tensor(times).to(device), out,
             )
             self.assertEqual(int(out.item()), want, (trial, q, thinking, times))

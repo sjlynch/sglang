@@ -160,6 +160,9 @@ class GenerationBatchResult:
     inkling_qiso_shadow: Optional[torch.Tensor] = None
     # The width P3 would have chosen on this round (QISO-x shadow control).
     inkling_p3_shadow: Optional[int] = None
+    # QISO-x active dispatch: (verified width, host wait ns, bubble ns or None,
+    # fallback) of the round; the host already read the width (the bounded sync).
+    inkling_qiso_active: Optional[tuple[int, int, Optional[int], bool]] = None
     # Valid output tokens that are not accepted draft proposals. Existing
     # algorithms have one bonus token; UNO also emits its clean root.
     num_non_draft_tokens_per_req: int = 1

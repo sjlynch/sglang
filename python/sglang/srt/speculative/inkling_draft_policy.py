@@ -24,9 +24,12 @@ CHANNELS.update({THINK_START: "thinking", 200049: "tool", 200057: "tool"})
 WIDTHS = (4, 5, 6, 8)  # Includes the target anchor.
 BATCH_MODES = ("control", "width", "head", "both")
 # QISO-x (Infera FLARE-LESSONS 1.6): "shadow" decides on the device every round and
-# records the counterfactual while verify stays pinned at width 8. A dispatching
-# mode needs the conditional-node graph that gate C qualifies first.
-WIDTH_SELECTOR_MODES = ("shadow",)
+# records the counterfactual while verify stays pinned at width 8. "active" (task
+# jf1ay) drafts with the pinned width-8 graph, decides on the device and verifies
+# with the chosen width's captured graph (inkling_width_dispatch.py).
+WIDTH_SELECTOR_MODES = ("shadow", "active")
+WIDTH_SELECTOR_KEYS = {"kind", "path", "sha256", "mode"}
+WIDTH_SELECTOR_OPTIONAL = {"force_width"}
 # Pilot costs from the held-out-calibrated policy simulator (ms, w4/5/6/8).
 SWARM_ROUND_MS = ((10.8, 11.35, 11.9, 12.9), (13.3, 13.95, 14.6, 16.3),
                   (14.95, 15.95, 16.95, 18.5), (16.6, 17.95, 19.3, 20.7))
@@ -76,12 +79,15 @@ class DraftPolicy:
     # QISO-x table (kind "qiso-x-table") and its mode; None keeps the selector off.
     width_selector: Artifact | None = None
     width_selector_mode: str | None = None
+    # Active mode only: verify every round at this width after the decision ran
+    # (pinned-width identity of gate C); None dispatches the decided width.
+    width_selector_force: int | None = None
 
     @property
     def capture_widths(self):
         if self.batch_mode in ("control", "head"):
             return (4,)
-        if self.acceptance_tracking:
+        if self.acceptance_tracking or self.width_selector_mode == "active":
             return WIDTHS
         widths = {
             width for tier in self.widths
@@ -190,7 +196,8 @@ class DraftPolicy:
             row = payload["width_selector"]
             if (
                 not isinstance(row, dict)
-                or row.keys() != {"kind", "path", "sha256", "mode"}
+                or not WIDTH_SELECTOR_KEYS <= row.keys()
+                or row.keys() - WIDTH_SELECTOR_KEYS - WIDTH_SELECTOR_OPTIONAL
                 or row["kind"] != "qiso-x-table"
                 or row["mode"] not in WIDTH_SELECTOR_MODES
                 or not isinstance(row["path"], str)
@@ -198,17 +205,23 @@ class DraftPolicy:
             ):
                 raise ValueError(
                     "width_selector requires kind qiso-x-table, an absolute pinned path, "
-                    f"sha256 and mode in {WIDTH_SELECTOR_MODES}"
+                    f"sha256 and mode in {WIDTH_SELECTOR_MODES} (optional force_width)"
                 )
             if policy.pin is None or policy.pin[1] != 8 or tracking:
                 raise ValueError(
-                    "QISO-x shadow needs verify pinned at width 8 (every depth verified) "
-                    "and no acceptance tracking"
+                    "QISO-x needs the width-8 graph pinned (shadow: every depth verified; "
+                    "active: the draft every decision reads) and no acceptance tracking"
                 )
+            force = row.get("force_width")
+            if force is not None and (row["mode"] != "active" or type(force) is not int or force not in WIDTHS):
+                raise ValueError(f"force_width needs active mode and a width in {WIDTHS}")
+            if row["mode"] == "active" and (policy.pin[0] != 0 or batch_mode not in ("width", "both")):
+                raise ValueError("QISO-x active dispatch drafts with stock head 0 on an overlap width arm")
             policy = replace(
                 policy,
                 width_selector=Artifact(row["kind"], Path(row["path"]), sha256_field(row["sha256"])),
                 width_selector_mode=row["mode"],
+                width_selector_force=force,
             )
         return policy
 
@@ -286,6 +299,26 @@ class RequestPhase:
 
     def alpha(self):
         return self.ewma_accepted / self.ewma_reached if self.acceptance_rounds >= ALPHA_WINDOW else 0.70
+
+
+# QISO-x table phases (inkling_width_selector.PHASES order).
+QISO_THINKING, QISO_ANSWER, QISO_TOOL = 0, 1, 2
+
+
+def qiso_phase_ids(requests):
+    """Each row's QISO-x table: thinking, tool (the tool-call channel or a grammar
+    row: agentic tool output) or answer. Reads the phase select_round updated."""
+    out = []
+    for req in requests:
+        state = getattr(req, "_inkling_draft_phase", None)
+        channel = state.channel if state is not None else "answer"
+        if channel == "thinking":
+            out.append(QISO_THINKING)
+        elif channel == "tool" or getattr(req, "grammar", None) is not None:
+            out.append(QISO_TOOL)
+        else:
+            out.append(QISO_ANSWER)
+    return out
 
 
 @dataclass
@@ -485,6 +518,16 @@ class DepthCounts:
     # P3 replayed on the same rounds from its own counterfactual observations.
     p3_widths: list[int] = field(default_factory=lambda: [0] * len(WIDTHS))
     p3_accepted: int = 0
+    # QISO-x active dispatch: rounds verified at the device-chosen width, the drafts
+    # they accepted, and the batch's host wait and bubble (sync return to verify
+    # launch) summed over this request's rounds.
+    qiso_active_rounds: int = 0
+    qiso_active_widths: list[int] = field(default_factory=lambda: [0] * len(WIDTHS))
+    qiso_active_accepted: int = 0
+    qiso_active_fallback: int = 0
+    qiso_active_wait_ns: int = 0
+    qiso_active_bubble_ns: int = 0
+    qiso_active_bubble_rounds: int = 0
 
     def record(self, drafted, accepted):
         accepted = min(drafted, max(0, accepted))
@@ -518,6 +561,16 @@ class DepthCounts:
                 "p3_widths": dict(zip(map(str, WIDTHS), self.p3_widths)),
                 "p3_accepted": self.p3_accepted,
             }
+        if self.qiso_active_rounds:
+            summary["qiso_x_active"] = {
+                "rounds": self.qiso_active_rounds,
+                "widths": dict(zip(map(str, WIDTHS), self.qiso_active_widths)),
+                "accepted": self.qiso_active_accepted,
+                "fallback": self.qiso_active_fallback,
+                "wait_ns": self.qiso_active_wait_ns,
+                "bubble_ns": self.qiso_active_bubble_ns,
+                "bubble_rounds": self.qiso_active_bubble_rounds,
+            }
         if self.suffix_checks:
             summary["anchor_suffix"] = {
                 "checks": self.suffix_checks,
@@ -529,7 +582,7 @@ class DepthCounts:
 
 
 def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=None, *, track_acceptance=False,
-                 qiso_width=None, draft_filter=None, p3_width=None):
+                 qiso_width=None, draft_filter=None, p3_width=None, qiso_active=None):
     if track_acceptance and thinking:
         req._inkling_draft_phase.observe_acceptance(drafted, accepted)
     counts = getattr(req, "_inkling_draft_depth", None)
@@ -554,6 +607,17 @@ def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=Non
             depth.p3_accepted += min(accepted, p3_width - 1)
             if thinking:
                 p3_shadow_phase(req).observe_acceptance(p3_width - 1, min(accepted, p3_width - 1))
+    if qiso_active is not None:
+        # (width, wait_ns, bubble_ns or None, fallback); drafted == width - 1.
+        width, wait_ns, bubble_ns, fallback = qiso_active
+        depth.qiso_active_rounds += 1
+        depth.qiso_active_widths[WIDTHS.index(width)] += 1
+        depth.qiso_active_accepted += min(drafted, max(0, accepted))
+        depth.qiso_active_fallback += bool(fallback)
+        depth.qiso_active_wait_ns += int(wait_ns or 0)
+        if bubble_ns is not None:
+            depth.qiso_active_bubble_ns += int(bubble_ns)
+            depth.qiso_active_bubble_rounds += 1
     if suffix_observation is not None:
         match, elapsed_ns = suffix_observation
         depth.suffix_checks += 1

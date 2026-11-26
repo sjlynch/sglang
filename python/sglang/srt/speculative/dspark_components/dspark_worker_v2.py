@@ -996,7 +996,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         on_publish,
         grammar_barrier=None,
         coordination_plan=None,
+        *,
+        after_propose=None,
+        injected_proposal=None,
     ) -> GenerationBatchResult:
+        """``after_propose(proposal)`` (Inkling QISO-x active dispatch) runs right
+        after this worker drafts; a non-None return is the round's result (another
+        width's verify ran) and this worker stops there. ``injected_proposal``
+        replaces this worker's draft with one already drafted for this round (the
+        width-8 draft sliced to this worker's width)."""
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
         draft_input = batch.spec_info
@@ -1048,7 +1056,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_model = self.target_worker.model_runner.model
         anchor_ids = (
             self._proposer.draft_block_ids_view(bs=bs, device=prefix_lens.device)
-            if self._prepare_inputs_once
+            if self._prepare_inputs_once and injected_proposal is None
             else None
         )
         window_seq_lens_cpu = (
@@ -1095,17 +1103,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._begin_simulated_step_ahead(
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
             )
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            proposal = self._proposer.propose(
-                batch=batch,
-                draft_input=draft_input,
-                verify_window=verify_window,
-                bs=bs,
-                device=device,
-                target_model=target_model,
-                sampling_info=sampling_info,
-                anchor_prepared=anchor_ids is not None,
-            )
+        if injected_proposal is not None:
+            proposal = injected_proposal
+        else:
+            with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                    anchor_prepared=anchor_ids is not None,
+                )
+            if after_propose is not None:
+                redirected = after_propose(proposal)
+                if redirected is not None:
+                    return redirected
         if self._verify_inputs_ready is not None:
             self._stage_target_verify_metadata(
                 batch=batch,

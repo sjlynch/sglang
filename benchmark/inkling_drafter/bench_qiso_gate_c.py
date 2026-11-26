@@ -11,9 +11,17 @@ Two costs decide whether a device-chosen verify width can pay (break-even about
    launching the chosen body graph directly. Built with the explicit node API in
    an inline CUDA extension, so no torch allocation happens during a capture.
 
-The engine half of gate C (16/16 greedy identity per pinned width through the
-conditional graph) needs the dispatch wired into the routing worker and runs after
-this passes.
+3. The bounded sync (task jf1ay, the dispatch the routing worker now runs in
+   QISO-x active mode): a stand-in width-8 draft graph, the decision, one event
+   wait for the width on the host, then the chosen stand-in verify graph, against
+   launching draft and verify back to back. This is the floor of the active
+   dispatch's added time: the engine adds its own verify-phase host work after the
+   wake-up, which the worker reports as ``bubble_us`` (telemetry
+   ``qiso_x_active.bubble_ns`` and the ``QISO-x dispatch`` log line).
+
+The engine half of gate C: 16/16 greedy identity per pinned width through the
+active dispatch (manifest ``width_selector.force_width``), and the engine's
+decision + bubble p50 <= 50 us (Infera ADAPTIVE-STACK M1).
 
     python benchmark/inkling_drafter/bench_qiso_gate_c.py --out qiso-gate-c.json
 """
@@ -152,14 +160,14 @@ def decision_cost(reps):
         logits = torch.randn(rows, 7, VOCAB, device="cuda").to(torch.bfloat16)
         tokens = torch.randint(0, VOCAB, (rows, 7), device="cuda")
         temps = torch.full((rows,), 0.7, device="cuda")
-        thinking = torch.ones(rows, dtype=torch.bool, device="cuda")
+        phase = torch.zeros(rows, dtype=torch.int64, device="cuda")  # thinking table
         active = torch.ones(rows, dtype=torch.bool, device="cuda")
         round_ms = torch.tensor([10.6, 11.1, 11.6, 12.5], dtype=torch.float64, device="cuda")
         out = torch.empty(1, dtype=torch.int64, device="cuda")
 
         def body():
             q = drafted_confidence(logits, tokens, temps)
-            qiso_width(q, thinking, active, rule.iso, rule.prior, rule.answer, round_ms, out)
+            qiso_width(q, phase, active, rule.iso, rule.prior, round_ms, out)
 
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -213,23 +221,77 @@ def switch_cost(reps, base_us):
     return rows_out
 
 
+def sync_cost(reps, base_us, draft_us):
+    """Bounded-sync dispatch floor: draft graph -> width copy -> host event wait ->
+    chosen verify graph, vs draft and verify launched back to back."""
+    from torch.utils.cpp_extension import load_inline
+
+    ext = load_inline(
+        name="qiso_gate_c_switch",
+        cpp_sources=CPP_DECL,
+        cuda_sources=CUDA_SRC,
+        functions=["build_direct", "build_switch", "launch"],
+        extra_cuda_cflags=["-O2"],
+        verbose=False,
+    )
+    widths = (4, 5, 6, 8)
+    draft = ext.build_direct(int(draft_us * 1000))
+    verify = {w: ext.build_direct(int(base_us * 1000 * w / 4)) for w in widths}
+    width_dev = torch.zeros(1, dtype=torch.int64, device="cuda")
+    width_host = torch.zeros(1, dtype=torch.int64, pin_memory=True)
+    ready = torch.cuda.Event()
+    rows_out = []
+    for width in widths:
+        width_dev.fill_(width)
+        torch.cuda.synchronize()
+
+        def direct():
+            ext.launch(draft)
+            ext.launch(verify[width])
+
+        def dispatched():
+            ext.launch(draft)
+            width_dev.add_(0)  # the decision's last write
+            width_host.copy_(width_dev, non_blocking=True)
+            ready.record()
+            ready.synchronize()
+            ext.launch(verify[int(width_host[0])])
+
+        d50, _ = timed(direct, reps)
+        s50, s90 = timed(dispatched, reps)
+        row = {"part": "sync", "width": width, "draft_us": draft_us, "verify_us": base_us * width / 4,
+               "direct_us_p50": round(d50, 2), "sync_us_p50": round(s50, 2), "sync_us_p90": round(s90, 2),
+               "added_us_p50": round(s50 - d50, 2)}
+        print(json.dumps(row))
+        rows_out.append(row)
+    return rows_out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reps", type=int, default=500)
     ap.add_argument("--body-us", type=float, default=2000.0,
                     help="stand-in verify body at width 4 (scaled by width)")
+    ap.add_argument("--draft-us", type=float, default=1500.0,
+                    help="stand-in width-8 draft graph before the bounded sync")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
     decision = decision_cost(args.reps)
     switch = switch_cost(args.reps, args.body_us)
-    worst = max(r["added_us_p50"] for r in decision) + max(r["added_us_p50"] for r in switch)
-    verdict = {"gate": "decision + switch added p50 <= 50 us per round (rows 1-4)",
-               "worst_added_us_p50": round(worst, 2), "pass": worst <= 50.0}
+    sync = sync_cost(args.reps, args.body_us, args.draft_us)
+    decide = max(r["added_us_p50"] for r in decision)
+    worst_switch = decide + max(r["added_us_p50"] for r in switch)
+    worst_sync = decide + max(r["added_us_p50"] for r in sync)
+    verdict = {"gate": "decision + dispatch added p50 <= 50 us per round (rows 1-4)",
+               "switch_worst_added_us_p50": round(worst_switch, 2), "switch_pass": worst_switch <= 50.0,
+               "sync_floor_worst_added_us_p50": round(worst_sync, 2), "sync_floor_pass": worst_sync <= 50.0,
+               "engine_note": "the active dispatch passes only if decision + the engine's bubble_us p50 <= 50",
+               "worst_added_us_p50": round(worst_switch, 2), "pass": worst_switch <= 50.0}
     print(json.dumps(verdict))
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump({"device": torch.cuda.get_device_name(), "torch": torch.__version__,
-                       "cuda": torch.version.cuda, "decision": decision, "switch": switch,
+                       "cuda": torch.version.cuda, "decision": decision, "switch": switch, "sync": sync,
                        "verdict": verdict}, f, indent=1)
 
 
