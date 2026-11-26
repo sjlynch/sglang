@@ -23,6 +23,10 @@ CHANNELS = dict.fromkeys(OTHER_CHANNELS | {THINK_END}, "answer")
 CHANNELS.update({THINK_START: "thinking", 200049: "tool", 200057: "tool"})
 WIDTHS = (4, 5, 6, 8)  # Includes the target anchor.
 BATCH_MODES = ("control", "width", "head", "both")
+# QISO-x (Infera FLARE-LESSONS 1.6): "shadow" decides on the device every round and
+# records the counterfactual while verify stays pinned at width 8. A dispatching
+# mode needs the conditional-node graph that gate C qualifies first.
+WIDTH_SELECTOR_MODES = ("shadow",)
 # Pilot costs from the held-out-calibrated policy simulator (ms, w4/5/6/8).
 SWARM_ROUND_MS = ((10.8, 11.35, 11.9, 12.9), (13.3, 13.95, 14.6, 16.3),
                   (14.95, 15.95, 16.95, 18.5), (16.6, 17.95, 19.3, 20.7))
@@ -69,6 +73,9 @@ class DraftPolicy:
     # table is still captured. Isolates one captured graph for identity tests.
     pin: tuple[int, int] | None = None
     acceptance_tracking: bool = False
+    # QISO-x table (kind "qiso-x-table") and its mode; None keeps the selector off.
+    width_selector: Artifact | None = None
+    width_selector_mode: str | None = None
 
     @property
     def capture_widths(self):
@@ -106,7 +113,7 @@ class DraftPolicy:
         payload = json.loads(data)
         if (
             not isinstance(payload, dict)
-            or payload.keys() - {"version", "stock_sha256", "thinking", "widths", "anchor_suffix_width8", "batch_mode", "pin", "acceptance_tracking"}
+            or payload.keys() - {"version", "stock_sha256", "thinking", "widths", "anchor_suffix_width8", "batch_mode", "pin", "acceptance_tracking", "width_selector"}
             or type(payload.get("version")) is not int
             or payload["version"] != 1
         ):
@@ -179,6 +186,30 @@ class DraftPolicy:
             ):
                 raise ValueError("A pin requires batch routing and a captured head and width")
             policy = replace(policy, pin=(row["head"], row["width"]))
+        if "width_selector" in payload:
+            row = payload["width_selector"]
+            if (
+                not isinstance(row, dict)
+                or row.keys() != {"kind", "path", "sha256", "mode"}
+                or row["kind"] != "qiso-x-table"
+                or row["mode"] not in WIDTH_SELECTOR_MODES
+                or not isinstance(row["path"], str)
+                or not Path(row["path"]).is_absolute()
+            ):
+                raise ValueError(
+                    "width_selector requires kind qiso-x-table, an absolute pinned path, "
+                    f"sha256 and mode in {WIDTH_SELECTOR_MODES}"
+                )
+            if policy.pin is None or policy.pin[1] != 8 or tracking:
+                raise ValueError(
+                    "QISO-x shadow needs verify pinned at width 8 (every depth verified) "
+                    "and no acceptance tracking"
+                )
+            policy = replace(
+                policy,
+                width_selector=Artifact(row["kind"], Path(row["path"]), sha256_field(row["sha256"])),
+                width_selector_mode=row["mode"],
+            )
         return policy
 
     @classmethod
@@ -431,6 +462,13 @@ class DepthCounts:
     suffix_matches: int = 0
     suffix_match_width8: int = 0
     suffix_ns: int = 0
+    # QISO-x shadow: per verified-at-8 round, the width the device chose and the
+    # drafts each policy would have accepted on the same draws (chain verify is
+    # prefix-consistent: a width-W verify accepts min(L8, W - 1)).
+    qiso_rounds: int = 0
+    qiso_widths: list[int] = field(default_factory=lambda: [0] * len(WIDTHS))
+    qiso_accepted: int = 0
+    fixed_accepted: list[int] = field(default_factory=lambda: [0] * len(WIDTHS))
 
     def record(self, drafted, accepted):
         accepted = min(drafted, max(0, accepted))
@@ -451,6 +489,13 @@ class DepthCounts:
             "accepted": self.accepted.copy(),
             "alpha": [a / r if r else None for a, r in zip(self.accepted, self.reached)],
         }
+        if self.qiso_rounds:
+            summary["qiso_x_shadow"] = {
+                "rounds": self.qiso_rounds,
+                "widths": dict(zip(map(str, WIDTHS), self.qiso_widths)),
+                "accepted": self.qiso_accepted,
+                "fixed_accepted": dict(zip(map(str, WIDTHS), self.fixed_accepted)),
+            }
         if self.suffix_checks:
             summary["anchor_suffix"] = {
                 "checks": self.suffix_checks,
@@ -461,7 +506,8 @@ class DepthCounts:
         return summary
 
 
-def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=None, *, track_acceptance=False):
+def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=None, *, track_acceptance=False,
+                 qiso_width=None):
     if track_acceptance and thinking:
         req._inkling_draft_phase.observe_acceptance(drafted, accepted)
     counts = getattr(req, "_inkling_draft_depth", None)
@@ -472,6 +518,13 @@ def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=Non
         counts[key] = DepthCounts()
     depth = counts[key]
     depth.record(drafted, accepted)
+    if qiso_width is not None and drafted == WIDTHS[-1] - 1:
+        accepted = min(drafted, max(0, accepted))
+        depth.qiso_rounds += 1
+        depth.qiso_widths[WIDTHS.index(qiso_width)] += 1
+        depth.qiso_accepted += min(accepted, qiso_width - 1)
+        for i, width in enumerate(WIDTHS):
+            depth.fixed_accepted[i] += min(accepted, width - 1)
     if suffix_observation is not None:
         match, elapsed_ns = suffix_observation
         depth.suffix_checks += 1

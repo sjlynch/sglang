@@ -156,6 +156,8 @@ class GenerationBatchResult:
     inkling_draft_route: Optional[tuple[tuple[bool, ...], tuple[bool, ...]]] = None
     inkling_track_acceptance: bool = False
     inkling_suffix_stats: Optional[list[Optional[tuple[bool, int]]]] = None
+    # QISO-x shadow: [1] int64 pinned host copy of the width the device chose.
+    inkling_qiso_shadow: Optional[torch.Tensor] = None
     # Valid output tokens that are not accepted draft proposals. Existing
     # algorithms have one bonus token; UNO also emits its clean root.
     num_non_draft_tokens_per_req: int = 1

@@ -1008,6 +1008,11 @@ class SchedulerBatchResultProcessor:
         self.advance_grammar_fsm(result, batch)
 
         predict_tokens = []
+        qiso_width = (
+            None
+            if result.inkling_qiso_shadow is None
+            else int(result.inkling_qiso_shadow[0])
+        )
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
@@ -1036,6 +1041,7 @@ class SchedulerBatchResultProcessor:
                         num_correct_drafts,
                         None if result.inkling_suffix_stats is None else result.inkling_suffix_stats[i],
                         track_acceptance=result.inkling_track_acceptance,
+                        qiso_width=qiso_width,
                     )
 
                 if block_accept_lens is not None:
