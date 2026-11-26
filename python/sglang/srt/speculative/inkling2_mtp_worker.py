@@ -90,6 +90,9 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         self._batch_workers = ()
         self._batch_width_index = {}
         self._qiso_table = self._qiso_rule = None
+        from sglang.srt.speculative.dspark_components.draft_filter import filtered_draft_enabled
+
+        self._filtered_draft = filtered_draft_enabled()
         if self.inkling_draft_policy is not None:
             policy = self.inkling_draft_policy
             if policy.width_selector is not None:
@@ -309,8 +312,27 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             worker._assert_native_graphs()
             return worker
 
+    def _stage_draft_filter_opt_out(self, batch):
+        """SGLANG_DSPARK_FILTERED_DRAFT: rows whose request sets custom_params
+        dspark_draft_filter false draft unfiltered, so one warm process can serve
+        both arms of an in-process A/B (Infera head_ab, task sal25)."""
+        sampling_info = getattr(batch, "sampling_info", None)
+        if sampling_info is None or not batch.reqs:
+            return
+        off = []
+        for req in batch.reqs:
+            custom = req.sampling_params.custom_params or {}
+            enabled = custom.get("dspark_draft_filter", True) is not False
+            req._dspark_draft_filter = enabled
+            off.append(not enabled)
+        sampling_info.draft_filter_off = (
+            async_h2d(off, dtype=torch.bool, device=self.device) if any(off) else None
+        )
+
     def forward_batch_generation(self, batch, on_publish=None, grammar_barrier=None, **kwargs):
         policy = self.inkling_draft_policy
+        if self._filtered_draft:
+            self._stage_draft_filter_opt_out(batch)
         if policy is None or not batch.forward_mode.is_decode() or batch.is_extend_in_batch:
             if policy is not None and policy.batch_mode is not None and batch.forward_mode.is_extend():
                 for req in batch.reqs:

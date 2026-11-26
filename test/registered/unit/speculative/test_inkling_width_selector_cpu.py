@@ -397,5 +397,20 @@ class ShadowManifestTests(unittest.TestCase):
         self.assertEqual(policy.telemetry(req)["thinking"]["stock"]["qiso_x_shadow"]["rounds"], 4)
 
 
+class DraftFilterTelemetryTests(unittest.TestCase):
+    def test_opt_out_is_validated_and_counted(self):
+        from types import SimpleNamespace
+
+        policy.validate_override({"dspark_draft_filter": False}, None)
+        with self.assertRaises(ValueError):
+            policy.validate_override({"dspark_draft_filter": "no"}, None)
+        req = SimpleNamespace()
+        policy.record_round(req, True, False, 3, 2, draft_filter=True)
+        policy.record_round(req, True, False, 3, 1, draft_filter=False)
+        policy.record_round(req, True, False, 3, 1, draft_filter=True)
+        summary = policy.telemetry(req)["thinking"]["stock"]
+        self.assertEqual(summary["draft_filter"], {"off": 1, "on": 2})
+
+
 if __name__ == "__main__":
     unittest.main()

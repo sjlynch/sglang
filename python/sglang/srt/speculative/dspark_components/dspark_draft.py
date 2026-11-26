@@ -204,6 +204,12 @@ def resolve_draft_params(
         if top_ks is not None:
             top_ks.copy_(sampling_info.top_ks.view(-1)[:bs])
             top_ps.copy_(sampling_info.top_ps.view(-1)[:bs])
+            # Per-request opt-out (custom_params dspark_draft_filter: false), staged
+            # by the Inkling worker: those rows draft from the unfiltered q.
+            off = getattr(sampling_info, "draft_filter_off", None)
+            if off is not None:
+                top_ks.masked_fill_(off[:bs], 1 << 30)
+                top_ps.masked_fill_(off[:bs], 1.0)
     return DraftParams(temperatures, greedy_mask, step_temperatures, top_ks, top_ps)
 
 
@@ -487,13 +493,16 @@ class DraftBlockProposer:
             bs,
             None if sampling_info is None else sampling_info.temperatures,
             None if sampling_info is None else sampling_info.top_ks,
+            # Read only by the filtered draft (SGLANG_DSPARK_FILTERED_DRAFT).
+            None if sampling_info is None else sampling_info.top_ps,
+            getattr(sampling_info, "draft_filter_off", None),
         )
         staged = self._staged_params_key
         self.num_staged_params_calls += 1
         skip = (
             staged is not None
             and staged[1] == bs
-            and all(staged[i] is key[i] for i in (0, 2, 3))
+            and all(staged[i] is key[i] for i in (0, 2, 3, 4, 5))
         )
         self.num_staged_params_skips += skip
         if self.num_staged_params_calls % STAGED_PARAMS_LOG_EVERY == 0:

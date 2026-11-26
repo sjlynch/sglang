@@ -219,6 +219,10 @@ class DraftPolicy:
 
 
 def validate_override(custom_params, policy):
+    if custom_params and "dspark_draft_filter" in custom_params and type(
+        custom_params["dspark_draft_filter"]
+    ) is not bool:
+        raise ValueError("dspark_draft_filter must be true or false")
     if not custom_params or "inkling_draft_variant" not in custom_params:
         return
     override = custom_params["inkling_draft_variant"]
@@ -465,6 +469,8 @@ class DepthCounts:
     # QISO-x shadow: per verified-at-8 round, the width the device chose and the
     # drafts each policy would have accepted on the same draws (chain verify is
     # prefix-consistent: a width-W verify accepts min(L8, W - 1)).
+    # SGLANG_DSPARK_FILTERED_DRAFT: rounds drafted with the request's filter off / on.
+    draft_filter_rounds: list[int] = field(default_factory=lambda: [0, 0])
     qiso_rounds: int = 0
     qiso_widths: list[int] = field(default_factory=lambda: [0] * len(WIDTHS))
     qiso_accepted: int = 0
@@ -489,6 +495,10 @@ class DepthCounts:
             "accepted": self.accepted.copy(),
             "alpha": [a / r if r else None for a, r in zip(self.accepted, self.reached)],
         }
+        if any(self.draft_filter_rounds):
+            summary["draft_filter"] = {
+                "off": self.draft_filter_rounds[0], "on": self.draft_filter_rounds[1]
+            }
         if self.qiso_rounds:
             summary["qiso_x_shadow"] = {
                 "rounds": self.qiso_rounds,
@@ -507,7 +517,7 @@ class DepthCounts:
 
 
 def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=None, *, track_acceptance=False,
-                 qiso_width=None):
+                 qiso_width=None, draft_filter=None):
     if track_acceptance and thinking:
         req._inkling_draft_phase.observe_acceptance(drafted, accepted)
     counts = getattr(req, "_inkling_draft_depth", None)
@@ -518,6 +528,8 @@ def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=Non
         counts[key] = DepthCounts()
     depth = counts[key]
     depth.record(drafted, accepted)
+    if draft_filter is not None:
+        depth.draft_filter_rounds[bool(draft_filter)] += 1
     if qiso_width is not None and drafted == WIDTHS[-1] - 1:
         accepted = min(drafted, max(0, accepted))
         depth.qiso_rounds += 1

@@ -1042,6 +1042,7 @@ class SchedulerBatchResultProcessor:
                         None if result.inkling_suffix_stats is None else result.inkling_suffix_stats[i],
                         track_acceptance=result.inkling_track_acceptance,
                         qiso_width=qiso_width,
+                        draft_filter=getattr(req, "_dspark_draft_filter", None),
                     )
 
                 if block_accept_lens is not None:
