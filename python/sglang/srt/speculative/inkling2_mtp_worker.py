@@ -24,6 +24,8 @@ from sglang.srt.speculative.inkling_draft_policy import (
     ROUND_COSTS,
     WIDTHS,
     DraftPolicy,
+    arm_width,
+    batch_width_arm,
     RequestPhase,
     p3_shadow_width,
     qiso_phase_ids,
@@ -244,6 +246,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
                 policy.width_selector.sha256[:12],
             )
         if policy.width_selector_mode == "active":
+            tracking_expectations()  # the in-process P3 arm
             missing = set(WIDTHS) - set(self._batch_width_index)
             if missing:
                 raise ValueError(f"QISO-x active dispatch needs captured verify widths {WIDTHS}")
@@ -426,9 +429,18 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             )
             batch._inkling_draft_completed_channels = None
             if self._qiso_dispatcher is not None:
-                result = self._qiso_dispatch_round(batch, on_publish, grammar_barrier)
+                arm, mixed = batch_width_arm(batch.reqs)
+                if arm == "qiso-x":
+                    result = self._qiso_dispatch_round(batch, on_publish, grammar_barrier)
+                else:
+                    # P3 or a fixed width on its own native graph (in-process M1 arms).
+                    width = arm_width(arm, batch.reqs, phases)
+                    worker = self._batch_workers[self._batch_width_index[width]]
+                    with get_spec().override(speculative_num_draft_tokens=width):
+                        result = worker._forward_decode(batch, on_publish, grammar_barrier)
                 result.inkling_draft_route = phases, (False,) * len(phases)
-                result.inkling_track_acceptance = False
+                result.inkling_track_acceptance = arm == "p3"
+                result.inkling_width_arm = arm, mixed
                 return result
             index = head * len(self._batch_width_index) + self._batch_width_index[width]
             worker = self._batch_workers[index]

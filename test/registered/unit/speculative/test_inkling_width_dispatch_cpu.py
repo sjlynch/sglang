@@ -701,14 +701,19 @@ class FakeWidthWorker:
     def _forward_decode(self, batch, on_publish, grammar_barrier, *, after_propose=None, injected_proposal=None):
         self.calls.append(injected_proposal)
         if injected_proposal is None:
-            assert self.width == 8
-            tokens = [[1, 2, 3, 4, 5, 0, 1]] * len(batch.reqs)
+            gamma = self.width - 1  # this worker's own native draft
+            tokens = [[1, 2, 3, 4, 5, 0, 1][:gamma]] * len(batch.reqs)
             q = [[0.99, 0.98, 0.97, 0.96, 0.95, 0.94, 0.93]] * len(batch.reqs)
-            block = block_from_q(q, tokens)
-            proposal = Proposal(torch.zeros(len(batch.reqs), 8, dtype=torch.long), block, folded=True)
-            redirected = after_propose(proposal)
-            if redirected is not None:
-                return redirected
+            block = block_from_q(q, [row + [0] * (7 - gamma) for row in tokens])
+            block = dataclasses.replace(
+                block, draft_tokens=block.draft_tokens[:, :gamma], corrected_logits=block.corrected_logits[:, :gamma]
+            )
+            proposal = Proposal(torch.zeros(len(batch.reqs), self.width, dtype=torch.long), block, folded=True)
+            if after_propose is not None:
+                assert self.width == 8
+                redirected = after_propose(proposal)
+                if redirected is not None:
+                    return redirected
         else:
             proposal = injected_proposal
         self._verify_executor.launched_ns = perf_counter_ns()
@@ -748,6 +753,71 @@ class WorkerProtocolTests(unittest.TestCase):
                 self.assertFalse(result.folded)
                 self.assertTrue(all(not workers[w].calls for w in sel.WIDTHS if w not in (8, expected)))
         self.assertEqual(worker._qiso_dispatcher.stats.rounds, 1)
+
+    def test_width_arms_share_one_process(self):
+        worker_mod, overrides = _load_worker()
+        table = sel.WidthTable.from_payload(v1_payload())
+        manifest = ActiveManifestTests()._manifest()
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.json"
+            path.write_text(json.dumps(manifest))
+            rules = policy.DraftPolicy.read(path)
+
+        def req(arm):
+            custom = {} if arm is None else {"inkling_width_arm": arm}
+            return SimpleNamespace(
+                origin_input_ids=[policy.THINK_START], output_ids=[5] * 4, grammar=None,
+                sampling_params=SimpleNamespace(custom_params=custom),
+            )
+
+        for arms, want_width, want_arm in (
+            ((None, None), 8, ("qiso-x", False)),
+            (("w4", "w4"), 4, ("w4", False)),
+            (("w6", "w6"), 6, ("w6", False)),
+            (("p3", "p3"), None, ("p3", False)),  # P3's own choice from its 0.70 prior
+            (("w6", "p3"), 4, ("w4", True)),  # rows disagree: the w4 control
+        ):
+            workers = {w: FakeWidthWorker(w) for w in sel.WIDTHS}
+            worker = worker_mod.Inkling2MTPWorker.__new__(worker_mod.Inkling2MTPWorker)
+            worker.inkling_draft_policy = rules
+            worker._filtered_draft = False
+            worker._batch_width_index = {w: i for i, w in enumerate(sel.WIDTHS)}
+            worker._batch_workers = tuple(workers[w] for w in sel.WIDTHS)
+            worker._qiso_dispatcher = disp.QisoDispatcher(disp.QisoDecision(table, "cpu", FALLBACK, 0.0))
+            batch = SimpleNamespace(
+                reqs=[req(arm) for arm in arms], is_extend_in_batch=False,
+                forward_mode=SimpleNamespace(is_decode=lambda: True),
+            )
+            result = worker.forward_batch_generation(batch)
+            if want_width is None:
+                want_width = policy.select_tracking_width(batch.reqs, (True, True))
+                self.assertNotEqual(want_width, 8)  # differs from the qiso-x round above
+            self.assertEqual(result.verified, want_width, arms)
+            self.assertEqual(result.inkling_width_arm, want_arm)
+            self.assertEqual(result.inkling_track_acceptance, want_arm[0] == "p3")
+            self.assertEqual(getattr(result, "inkling_qiso_active", None) is not None, want_arm[0] == "qiso-x")
+            self.assertEqual(result.inkling_draft_route[0], (True, True))
+
+    def test_width_arm_validation_and_telemetry(self):
+        manifest = ActiveManifestTests()._manifest()
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.json"
+            path.write_text(json.dumps(manifest))
+            active = policy.DraftPolicy.read(path)
+            path.write_text(json.dumps(ActiveManifestTests()._manifest("shadow")))
+            shadow = policy.DraftPolicy.read(path)
+        for arm in policy.WIDTH_ARMS:
+            policy.validate_override({"inkling_width_arm": arm}, active)
+        for custom, rules in (({"inkling_width_arm": "w7"}, active), ({"inkling_width_arm": "p3"}, shadow),
+                              ({"inkling_width_arm": "p3"}, None)):
+            with self.assertRaises(ValueError):
+                policy.validate_override(custom, rules)
+        r = SimpleNamespace()
+        policy.record_round(r, True, False, 3, 1, width_arm=("w4", False))
+        policy.record_round(r, True, False, 3, 2, width_arm=("w4", True))
+        policy.record_round(r, True, False, 7, 2, width_arm=("qiso-x", False), qiso_active=(8, 0, None, False))
+        arm = policy.telemetry(r)["thinking"]["stock"]["width_arm"]
+        self.assertEqual(arm, {"rounds": {"w4": 2, "qiso-x": 1}, "mixed": 1})
 
 
 if __name__ == "__main__":

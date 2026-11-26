@@ -29,6 +29,13 @@ BATCH_MODES = ("control", "width", "head", "both")
 # with the chosen width's captured graph (inkling_width_dispatch.py).
 WIDTH_SELECTOR_MODES = ("shadow", "active")
 WIDTH_SELECTOR_KEYS = {"kind", "path", "sha256", "mode"}
+# Active mode: per-request width arm (custom_params inkling_width_arm) so one warm
+# process serves QISO-x, P3 and fixed-width arms for an in-process panel (M1). A
+# round's batch takes one arm; a batch whose rows disagree runs the w4 control.
+WIDTH_ARM_PARAM = "inkling_width_arm"
+WIDTH_ARMS = ("qiso-x", "p3", "w4", "w5", "w6", "w8")
+DEFAULT_WIDTH_ARM = "qiso-x"
+MIXED_WIDTH_ARM = "w4"
 WIDTH_SELECTOR_OPTIONAL = {"force_width"}
 # Pilot costs from the held-out-calibrated policy simulator (ms, w4/5/6/8).
 SWARM_ROUND_MS = ((10.8, 11.35, 11.9, 12.9), (13.3, 13.95, 14.6, 16.3),
@@ -236,6 +243,12 @@ def validate_override(custom_params, policy):
         custom_params["dspark_draft_filter"]
     ) is not bool:
         raise ValueError("dspark_draft_filter must be true or false")
+    if custom_params and WIDTH_ARM_PARAM in custom_params and (
+        policy is None
+        or policy.width_selector_mode != "active"
+        or custom_params[WIDTH_ARM_PARAM] not in WIDTH_ARMS
+    ):
+        raise ValueError(f"{WIDTH_ARM_PARAM} needs a QISO-x active manifest and one of {WIDTH_ARMS}")
     if not custom_params or "inkling_draft_variant" not in custom_params:
         return
     override = custom_params["inkling_draft_variant"]
@@ -482,6 +495,26 @@ def select_tracking_width(requests, phases, alpha_of=None):
     return WIDTHS[best]
 
 
+def request_width_arm(req):
+    custom = req.sampling_params.custom_params or {}
+    return custom.get(WIDTH_ARM_PARAM, DEFAULT_WIDTH_ARM)
+
+
+def batch_width_arm(requests):
+    """(arm, mixed): the one arm every row asked for, else the w4 control."""
+    arms = {request_width_arm(req) for req in requests}
+    if len(arms) == 1:
+        return arms.pop(), False
+    return MIXED_WIDTH_ARM, True
+
+
+def arm_width(arm, requests, phases):
+    """The verify width of a non-QISO-x arm: P3's tracked choice or the fixed width."""
+    if arm == "p3":
+        return select_tracking_width(requests, phases)
+    return int(arm[1:])
+
+
 def select_batch_round(policy, requests, queued, completed_channels=None):
     """Choose the next batch from committed host state and scheduler counts."""
     requested_width, phases, _ = select_round(
@@ -528,6 +561,10 @@ class DepthCounts:
     qiso_active_wait_ns: int = 0
     qiso_active_bubble_ns: int = 0
     qiso_active_bubble_rounds: int = 0
+    # Active mode: rounds per width arm (proof of which arm served the request)
+    # and rounds run on the w4 control because the batch's rows disagreed.
+    width_arm_rounds: dict = field(default_factory=dict)
+    width_arm_mixed: int = 0
 
     def record(self, drafted, accepted):
         accepted = min(drafted, max(0, accepted))
@@ -571,6 +608,8 @@ class DepthCounts:
                 "bubble_ns": self.qiso_active_bubble_ns,
                 "bubble_rounds": self.qiso_active_bubble_rounds,
             }
+        if self.width_arm_rounds:
+            summary["width_arm"] = {"rounds": dict(self.width_arm_rounds), "mixed": self.width_arm_mixed}
         if self.suffix_checks:
             summary["anchor_suffix"] = {
                 "checks": self.suffix_checks,
@@ -582,7 +621,7 @@ class DepthCounts:
 
 
 def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=None, *, track_acceptance=False,
-                 qiso_width=None, draft_filter=None, p3_width=None, qiso_active=None):
+                 qiso_width=None, draft_filter=None, p3_width=None, qiso_active=None, width_arm=None):
     if track_acceptance and thinking:
         req._inkling_draft_phase.observe_acceptance(drafted, accepted)
     counts = getattr(req, "_inkling_draft_depth", None)
@@ -607,6 +646,10 @@ def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=Non
             depth.p3_accepted += min(accepted, p3_width - 1)
             if thinking:
                 p3_shadow_phase(req).observe_acceptance(p3_width - 1, min(accepted, p3_width - 1))
+    if width_arm is not None:
+        arm, mixed = width_arm
+        depth.width_arm_rounds[arm] = depth.width_arm_rounds.get(arm, 0) + 1
+        depth.width_arm_mixed += bool(mixed)
     if qiso_active is not None:
         # (width, wait_ns, bubble_ns or None, fallback); drafted == width - 1.
         width, wait_ns, bubble_ns, fallback = qiso_active

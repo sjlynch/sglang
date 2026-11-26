@@ -163,6 +163,8 @@ class GenerationBatchResult:
     # QISO-x active dispatch: (verified width, host wait ns, bubble ns or None,
     # fallback) of the round; the host already read the width (the bounded sync).
     inkling_qiso_active: Optional[tuple[int, int, Optional[int], bool]] = None
+    # QISO-x active manifest: (width arm, rows disagreed) of the round.
+    inkling_width_arm: Optional[tuple[str, bool]] = None
     # Valid output tokens that are not accepted draft proposals. Existing
     # algorithms have one bonus token; UNO also emits its clean root.
     num_non_draft_tokens_per_req: int = 1
