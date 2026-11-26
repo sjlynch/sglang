@@ -16,10 +16,14 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     block_accept_estimate_enabled,
 )
+from sglang.srt.speculative.dspark_components.draft_filter import (
+    filtered_draft_enabled,
+    filtered_draft_max_top_k,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
-    DraftParams,
     draft_markov_block,
+    new_draft_params,
     resolve_draft_params,
     select_draft_hidden_without_anchor,
     step_logits_width,
@@ -100,13 +104,18 @@ class DsparkDraftSampler:
         self.sharded_accept = sharded_accept
         self._noise = noise
         self._tp_sync = tp_sync
+        # SGLANG_DSPARK_FILTERED_DRAFT: the graph also reads staged top-k/top-p.
+        self.filtered = filtered_draft_enabled() and not greedy_draft
+        if self.filtered and (
+            sharded_accept or self.markov_head.vocab_shard is not None
+        ):
+            raise ValueError(
+                "SGLANG_DSPARK_FILTERED_DRAFT needs the whole draft vocab on one rank"
+            )
+        self._max_top_k = filtered_draft_max_top_k() if self.filtered else 0
         # Staged before each replay.
-        self.params = DraftParams(
-            temperatures=torch.ones((self.max_bs,), dtype=torch.float32, device=device),
-            greedy_mask=torch.ones((self.max_bs,), dtype=torch.bool, device=device),
-            step_temperatures=torch.zeros(
-                (self.max_bs,), dtype=torch.float32, device=device
-            ),
+        self.params = new_draft_params(
+            self.max_bs, device, filtered=self.filtered, fill_greedy=True
         )
         # [max_bs, gamma, vocab] step logits for sampling accept. The stock path
         # sizes it on first use; a bound specialized path may allocate it now.
@@ -129,7 +138,8 @@ class DsparkDraftSampler:
                 dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
                 device=self.out.device,
             ),
-            specialize=acceptance_estimator is None,
+            # A specialized (megakernel) proposal does not apply the draft filter.
+            specialize=acceptance_estimator is None and not self.filtered,
         )
         self._draft_strategy = bound_strategy.strategy
         self.step_logits = bound_strategy.step_logits
@@ -141,6 +151,11 @@ class DsparkDraftSampler:
 
     def _init_markov_walker(self, walker: MarkovWalker) -> None:
         assert walker.gamma == self.gamma, (walker.gamma, self.gamma)
+        if self.filtered:
+            raise ValueError(
+                "SGLANG_DSPARK_FILTERED_DRAFT is not implemented in the int8 markov "
+                "walk; unset SGLANG_DSPARK_OPT_INT8_MARKOV_WALK"
+            )
         if not self.greedy_draft:
             # The kernel writes bf16 logits and leaves temperature-0 rows' unwritten; a
             # mixed accept still reads them.
@@ -253,6 +268,9 @@ class DsparkDraftSampler:
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
             sharded_accept=self.sharded_accept,
+            draft_filter=(
+                self.params.draft_filter(self._max_top_k) if self.filtered else None
+            ),
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         return draft_tokens, confidence_features

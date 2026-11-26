@@ -585,6 +585,12 @@ class Envs:
     # Argmax every draft row, sampling requests included, accepted as a one-hot
     # draft: no step logits kept, lower acceptance at high temperatures.
     SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
+    # Apply each request's top-k/top-p to the draft rows before sampling them; verify
+    # reads the same filtered draft distribution, so speculative sampling stays exact
+    # (Infera THINKING-CEILINGS, task 7adin). Rows without a filter are unchanged.
+    SGLANG_DSPARK_FILTERED_DRAFT = EnvBool(False)
+    # Candidates the draft filter ranks per row; a wider keep set leaves the row unfiltered.
+    SGLANG_DSPARK_FILTERED_DRAFT_MAX_TOP_K = EnvInt(64)
     # Ragged verify takes its confidences from the online acceptance estimator even
     # when the draft checkpoint has a confidence head.
     SGLANG_DSPARK_USE_ONLINE_ESTIMATOR = EnvBool(False)

@@ -22,6 +22,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dspark_components.draft_filter import (
+    DraftFilter,
+    filtered_draft_enabled,
+    filtered_draft_max_top_k,
+)
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
@@ -125,6 +130,36 @@ class DraftParams(NamedTuple):
     greedy_mask: torch.Tensor
     # The temperature each step samples at: 0 on argmax rows.
     step_temperatures: torch.Tensor
+    # SGLANG_DSPARK_FILTERED_DRAFT only: the request's top-k / top-p per row.
+    top_ks: Optional[torch.Tensor] = None
+    top_ps: Optional[torch.Tensor] = None
+
+    def draft_filter(self, max_top_k: int) -> Optional[DraftFilter]:
+        if self.top_ks is None:
+            return None
+        return DraftFilter(self.top_ks, self.top_ps, max_top_k)
+
+
+def new_draft_params(
+    rows: int, device, *, filtered: bool, fill_greedy: bool = False
+) -> DraftParams:
+    """Graph-static staging buffers (``fill_greedy``: the sampler's initial state)."""
+    make = torch.ones if fill_greedy else torch.empty
+    return DraftParams(
+        temperatures=make((rows,), dtype=torch.float32, device=device),
+        greedy_mask=make((rows,), dtype=torch.bool, device=device),
+        step_temperatures=torch.zeros((rows,), dtype=torch.float32, device=device),
+        top_ks=(
+            torch.full((rows,), 1 << 30, dtype=torch.int64, device=device)
+            if filtered
+            else None
+        ),
+        top_ps=(
+            torch.ones((rows,), dtype=torch.float32, device=device)
+            if filtered
+            else None
+        ),
+    )
 
 
 @functools.cache
@@ -140,20 +175,24 @@ def resolve_draft_params(
     out: Optional[DraftParams] = None,
 ) -> DraftParams:
     """Written into the ``[:bs]`` rows of ``out`` when given (the graph's
-    static buffers), else into fresh tensors on ``device``."""
+    static buffers), else into fresh tensors on ``device``. Top-k/top-p are
+    staged too when ``out`` has those buffers (SGLANG_DSPARK_FILTERED_DRAFT)."""
     if out is not None:
         device = out.temperatures.device
     else:
-        out = DraftParams(
-            temperatures=torch.empty(bs, dtype=torch.float32, device=device),
-            greedy_mask=torch.empty(bs, dtype=torch.bool, device=device),
-            step_temperatures=torch.empty(bs, dtype=torch.float32, device=device),
-        )
-    temperatures, greedy_mask, step_temperatures = (buf[:bs] for buf in out)
+        out = new_draft_params(bs, device, filtered=filtered_draft_enabled())
+    temperatures = out.temperatures[:bs]
+    greedy_mask = out.greedy_mask[:bs]
+    step_temperatures = out.step_temperatures[:bs]
+    top_ks = None if out.top_ks is None else out.top_ks[:bs]
+    top_ps = None if out.top_ps is None else out.top_ps[:bs]
     if sampling_info is None:
         temperatures.fill_(1.0)
         greedy_mask.fill_(True)
         step_temperatures.zero_()
+        if top_ks is not None:
+            top_ks.fill_(1 << 30)
+            top_ps.fill_(1.0)
     else:
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
@@ -162,7 +201,10 @@ def resolve_draft_params(
         )
         torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
         torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
-    return DraftParams(temperatures, greedy_mask, step_temperatures)
+        if top_ks is not None:
+            top_ks.copy_(sampling_info.top_ks.view(-1)[:bs])
+            top_ps.copy_(sampling_info.top_ps.view(-1)[:bs])
+    return DraftParams(temperatures, greedy_mask, step_temperatures, top_ks, top_ps)
 
 
 # Arbitrary; how often the proposer logs its restage-skip count, in graph steps.
@@ -205,6 +247,7 @@ def _draft_step(
     step: int,
     logits_out: Optional[torch.Tensor],
     sharded_accept: bool,
+    draft_filter: Optional[DraftFilter] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     # The fused kernel has no vocab mask, and softcap rounding can tie its argmax.
     if (
@@ -249,6 +292,8 @@ def _draft_step(
         has_sampled_rows=None if logits_out is not None else False,
         softcap=markov_head.step_softcap,
         vocab_limit=markov_head.step_vocab_limit,
+        # Only a kept-logits step samples; argmax-only steps have nothing to filter.
+        draft_filter=draft_filter if logits_out is not None else None,
         **sharded,
     )
     return tokens, state
@@ -266,10 +311,20 @@ def draft_markov_block(
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
     sharded_accept: bool = False,
+    draft_filter: Optional[DraftFilter] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Returns the drafted tokens and the [bs, gamma, width] step logits, written
     to ``logits_out`` or allocated here; width is the vocab, or this rank's vocab
-    shard with ``sharded_accept``. A greedy draft keeps no logits."""
+    shard with ``sharded_accept``. A greedy draft keeps no logits. With
+    ``draft_filter`` the kept logits are the filtered q' each token was drawn
+    from (SGLANG_DSPARK_FILTERED_DRAFT)."""
+    if draft_filter is not None and (
+        greedy_draft or sharded_accept or markov_head.vocab_shard is not None
+    ):
+        raise ValueError(
+            "SGLANG_DSPARK_FILTERED_DRAFT needs a sampled draft with the whole "
+            "vocab on one rank (no greedy draft, no vocab-sharded markov head)"
+        )
     bs, gamma = base_logits.shape[:2]
     if not greedy_draft and logits_out is None:
         width = step_logits_width(markov_head, base_logits.shape[-1], sharded_accept)
@@ -293,6 +348,7 @@ def draft_markov_block(
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
             sharded_accept=sharded_accept,
+            draft_filter=draft_filter,
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -318,6 +374,9 @@ def sample_draft_block(
     params = resolve_draft_params(
         sampling_info=sampling_info, bs=base_logits.shape[0], device=device
     )
+    draft_filter = (
+        None if greedy_draft else params.draft_filter(filtered_draft_max_top_k())
+    )
     draft_tokens, step_logits = draft_markov_block(
         markov_head=markov_head,
         base_logits=base_logits,
@@ -328,6 +387,7 @@ def sample_draft_block(
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
         sharded_accept=sharded_accept,
+        draft_filter=draft_filter,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,

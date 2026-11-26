@@ -10,6 +10,10 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.speculative.dspark_components.draft_filter import (
+    DraftFilter,
+    apply_draft_filter_,
+)
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -252,12 +256,23 @@ def _launch_partial(
     return partial.view(rows, parts * 2)
 
 
+def _rows_filter(draft_filter: DraftFilter, rows: int) -> DraftFilter:
+    return DraftFilter(
+        draft_filter.top_ks[:rows], draft_filter.top_ps[:rows], draft_filter.max_top_k
+    )
+
+
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
     without ``gather_logits`` the kept logits stay on the shard.
-    ``has_sampled_rows=False`` argmaxes every row."""
+    ``has_sampled_rows=False`` argmaxes every row.
+
+    ``draft_filter`` (SGLANG_DSPARK_FILTERED_DRAFT) writes -inf outside each
+    row's top-k/top-p keep set into the kept ``logits_out`` before the draw, so
+    the token is drawn from the same filtered q' that verify reads. It needs the
+    kept logits on one rank (no ``gather``/``gather_logits``)."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
@@ -280,6 +295,7 @@ class MarkovSampleStep:
         gather,
         gather_logits,
         logits_out,
+        draft_filter=None,
     ):
         assert base_logits.ndim == bias.ndim == 2
         assert bias.shape[0] == base_logits.shape[0]
@@ -298,6 +314,13 @@ class MarkovSampleStep:
             else:
                 assert gather is not None
                 assert logits_out.shape[0] == base_logits.shape[0]
+        if draft_filter is not None:
+            assert logits_out is not None, "a filtered draft keeps its step logits"
+            assert gather is None and gather_logits is None, (
+                "the filtered draft needs the whole vocab on one rank"
+            )
+            assert draft_filter.top_ks.shape[0] >= base_logits.shape[0]
+            assert draft_filter.top_ps.shape[0] >= base_logits.shape[0]
 
     @classmethod
     def triton(
@@ -317,6 +340,7 @@ class MarkovSampleStep:
         has_sampled_rows: Optional[bool] = None,
         softcap: Optional[float] = None,
         vocab_limit: Optional[int] = None,
+        draft_filter: Optional[DraftFilter] = None,
     ) -> torch.Tensor:
         cls._check(
             base_logits,
@@ -328,8 +352,10 @@ class MarkovSampleStep:
             gather,
             gather_logits,
             logits_out,
+            draft_filter,
         )
         rows, width = bias.shape
+        rows_filter = None if draft_filter is None else _rows_filter(draft_filter, rows)
         launch = functools.partial(
             _launch_partial,
             temperatures=temperatures,
@@ -355,6 +381,23 @@ class MarkovSampleStep:
             )
             full = gather_logits(local)[:, : logits_out.shape[1]]
             gathered = launch(full, None, width=full.shape[1], store=logits_out)
+        elif rows_filter is not None:
+            # Store the step logits, filter them in place, then draw from them with
+            # the same Philox words: an identity row picks the same token.
+            launch(
+                base_logits,
+                bias,
+                width=width,
+                store=logits_out,
+                select=False,
+                vocab_start=vocab_start,
+                softcap=softcap,
+                vocab_limit=vocab_limit,
+            )
+            apply_draft_filter_(logits_out, temperatures, rows_filter)
+            gathered = launch(
+                logits_out, None, width=width, store=None, vocab_start=vocab_start
+            )
         else:
             partial = launch(
                 base_logits,
@@ -398,6 +441,7 @@ class MarkovSampleStep:
         has_sampled_rows: Optional[bool] = None,
         softcap: Optional[float] = None,
         vocab_limit: Optional[int] = None,
+        draft_filter: Optional[DraftFilter] = None,
     ) -> torch.Tensor:
         # None draws the noise for every row: reading the temperatures on the
         # host would break a graph capture.
@@ -411,8 +455,10 @@ class MarkovSampleStep:
             gather,
             gather_logits,
             logits_out,
+            draft_filter,
         )
         rows, width = bias.shape
+        rows_filter = None if draft_filter is None else _rows_filter(draft_filter, rows)
         value = base_logits.to(torch.float32, copy=True)
         value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
@@ -421,6 +467,8 @@ class MarkovSampleStep:
         if vocab_limit is not None:
             columns = vocab_start + torch.arange(value.shape[1], device=value.device)
             value[:, columns >= vocab_limit] = float("-inf")
+        if rows_filter is not None:
+            apply_draft_filter_(value, temperatures, rows_filter)
         if gather_logits is not None and logits_out is not None:
             full = gather_logits(value.to(step_dtype))[:, : logits_out.shape[1]]
             return cls.torch(
