@@ -1,5 +1,6 @@
 import itertools
 import logging
+import os
 from copy import copy
 from pathlib import Path
 from time import perf_counter_ns
@@ -17,6 +18,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.draft_worker_common import DraftWorkerBundle
+from sglang.srt.speculative.inkling_block_drafter import (
+    BLOCK_ARCH_ENV,
+    QISO_TABLE_TRANSFER_ENV,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.inkling_draft_policy import (
@@ -99,6 +104,18 @@ class Inkling2MTPVerifyExecutor(TargetVerifyExecutor):
             )
 
 
+def qiso_table_transfer_allowed(pinned_head: int) -> bool:
+    """A QISO-x table fitted for another head may drive a block-drafter research head
+    (SGLANG_INKLING2_MTP_BLOCK_ARCH set) when SGLANG_INKLING_QISO_TABLE_TRANSFER=1.
+    The width rule reads the drafted q through a stopping time, so any table is exact;
+    a transferred one is only untuned (refit it from SGLANG_INKLING_QISO_ROUND_LOG)."""
+    return (
+        pinned_head == 0
+        and bool(os.environ.get(BLOCK_ARCH_ENV))
+        and os.environ.get(QISO_TABLE_TRANSFER_ENV, "") in ("1", "true", "True")
+    )
+
+
 class Inkling2MTPWorker(DSparkWorkerV2):
     def __init__(self, *args, **kwargs):
         if get_disagg().disaggregation_mode != "null":
@@ -124,7 +141,14 @@ class Inkling2MTPWorker(DSparkWorkerV2):
                     policy.width_selector.path, policy.width_selector.sha256
                 )
                 if policy.pin[0] != 0 or self._qiso_table.head_sha256 != policy.stock_sha256:
-                    raise ValueError("The QISO-x table must be fitted for the pinned stock head")
+                    if not qiso_table_transfer_allowed(policy.pin[0]):
+                        raise ValueError("The QISO-x table must be fitted for the pinned stock head")
+                    logger.warning(
+                        "QISO-x table %s was fitted for head %s, served head %s: transferred "
+                        "(%s=1, block-drafter research); widths stay exact, not tuned for this head",
+                        policy.width_selector.sha256[:12], self._qiso_table.head_sha256[:12],
+                        policy.stock_sha256[:12], QISO_TABLE_TRANSFER_ENV,
+                    )
                 if envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get():
                     raise ValueError("QISO-x reads the sampled draft's kept step logits")
             parallel = get_parallel()
@@ -150,13 +174,10 @@ class Inkling2MTPWorker(DSparkWorkerV2):
                 raise ValueError("Inkling routing requires static native graphs and real inline verification")
             if not 2 <= self.query_token_num <= self.draft_model.config.block_size:
                 raise ValueError("Inkling routing width exceeds the checkpoint block size")
-            if any(
-                getattr(layer, name, None) is not None
-                for layer in self.draft_model.layers for name in ("attention_conv", "mlp_conv")
-            ):
-                # Width views share draft layers; a block-size-indexed convolution would
-                # take the last view's block size for every width.
-                raise ValueError("Inkling routing cannot share block-size-dependent draft layers")
+            # Width views share draft layers. Block-size-indexed research modules (K1
+            # conv, C2 depth experts; SGLANG_INKLING2_MTP_BLOCK_ARCH) take each view's
+            # block size in Inkling2ForConditionalGenerationMTP.forward, before its graphs
+            # capture, so every width keeps its own (Infera task 5k0kt).
             self.draft_model.block_size = self.query_token_num
             self.draft_model.gamma = self.gamma
         else:

@@ -1,4 +1,3 @@
-import json
 from typing import Any, TypedDict
 
 from transformers import PretrainedConfig
@@ -265,19 +264,6 @@ def inkling2_config_from_dict(config: dict[str, Any]) -> Inkling2MMConfig:
     return cls(**config)
 
 
-BLOCK_ARCH_KEYS = {
-    "n_layers",
-    "local_layers",
-    "window",
-    "init_layers",
-    "block_conv",
-    "conv_group",
-    "tap_fc",
-    "selector_rank",
-    "selector_topk",
-}
-
-
 def research_block_arch(draft: dict[str, Any]) -> dict[str, Any] | None:
     """The K-arm architecture from SGLANG_INKLING2_MTP_BLOCK_ARCH, validated, or None.
 
@@ -287,25 +273,9 @@ def research_block_arch(draft: dict[str, Any]) -> dict[str, Any] | None:
     """
     from sglang.srt.environ import envs
 
-    raw = envs.SGLANG_INKLING2_MTP_BLOCK_ARCH.get()
-    if not raw:
-        return None
-    arch = json.loads(raw)
-    if not isinstance(arch, dict) or set(arch) - BLOCK_ARCH_KEYS:
-        raise ValueError(f"Unknown Inkling2 MTP block architecture: {raw}")
-    if arch.get("selector_rank") or arch.get("selector_topk"):
-        raise ValueError(
-            "Inkling2 MTP selector heads (K4) need a candidate walk; not servable here"
-        )
-    if arch.get("block_conv", 0) not in (0, 2) or (
-        arch.get("block_conv") and arch.get("conv_group") != 16
-    ):
-        raise ValueError("Inkling2 MTP block convolution must be 2 taps x 16 channels")
-    if arch.get("window", draft["sliding_window_size"]) != draft["sliding_window_size"]:
-        raise ValueError("Inkling2 MTP block head window differs from the checkpoint's")
-    if int(arch.get("n_layers", draft["num_hidden_layers"])) < draft["num_hidden_layers"]:
-        raise ValueError("Inkling2 MTP block heads only add layers")
-    return arch
+    from sglang.srt.speculative.inkling_block_drafter import parse_block_arch
+
+    return parse_block_arch(envs.SGLANG_INKLING2_MTP_BLOCK_ARCH.get(), draft)
 
 
 class Inkling2MTPConfig(PretrainedConfig):
@@ -347,6 +317,11 @@ class Inkling2MTPConfig(PretrainedConfig):
             draft["local_layer_ids"] = list(
                 block_arch.get("local_layers", draft["local_layer_ids"])
             )
+            if block_arch.get("ffn_extra"):
+                # C1: the extra SwiGLU channels are merged onto the stock MLP at load.
+                draft["intermediate_size"] = int(draft["intermediate_size"]) + int(
+                    block_arch["ffn_extra"]
+                )
         if any(
             draft[key] != "bfloat16" for key in ("dtype", "torch_dtype") if key in draft
         ):
@@ -415,4 +390,6 @@ class Inkling2MTPConfig(PretrainedConfig):
                     conv_group_size=int(block_arch["conv_group"]),
                 )
             draft["mtp_tap_fc"] = bool(block_arch.get("tap_fc"))
+            draft["mtp_ffn_extra"] = int(block_arch.get("ffn_extra", 0) or 0)
+            draft["mtp_depth_experts"] = int(block_arch.get("depth_experts", 0) or 0)
         return cls(**draft)

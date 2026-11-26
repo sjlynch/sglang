@@ -2320,10 +2320,16 @@ class Envs:
     # decode kernel, all draft tokens of a sequence in one launch; changes the
     # softmax reduction order.
     SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL = EnvBool(False)
-    # Research only (Infera BLOCK-DRAFTER.md, K1-K3): the "block_arch" JSON from
-    # an mtp-block.safetensors head (two-tap block convolution, full-rank tap
-    # fusion, extra local layers). Empty (default): the shipped MTP head, unchanged.
+    # Research only (Infera BLOCK-DRAFTER.md, BLOCK-DRAFTER-SERVING.md; K1-K3, C1, C2):
+    # the "block_arch" JSON from an mtp-block.safetensors head (two-tap block
+    # convolution, full-rank tap fusion, extra local layers, extra FFN channels, depth
+    # experts). Empty (default): the shipped MTP head, unchanged. See
+    # speculative/inkling_block_drafter.py (inspect / prepare CLI).
     SGLANG_INKLING2_MTP_BLOCK_ARCH = EnvStr("")
+    # Research only, with SGLANG_INKLING2_MTP_BLOCK_ARCH: let a QISO-x table fitted for
+    # another head drive the block head (exact, untuned). Default off: the table must
+    # name the served head.
+    SGLANG_INKLING_QISO_TABLE_TRANSFER = EnvBool(False)
     # Decode and MTP verify attention all-reduce through the push all-reduce
     # (rank-order FP32 sum) instead of the multimem one-shot.
     SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)

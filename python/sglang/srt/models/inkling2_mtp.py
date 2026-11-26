@@ -26,6 +26,10 @@ from sglang.srt.models.dspark import (
     project_through_lm_head,
 )
 from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.speculative.inkling_block_drafter import (
+    DepthExperts,
+    merge_ffn_extra,
+)
 
 
 class Inkling2MTPHead(BaseDSparkMarkovHead):
@@ -155,6 +159,19 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         )
         if self.tap_fc is not None:
             self.tap_fc.weight.requires_grad_(False)
+        # Research C1 (ffn_extra): the extra SwiGLU channels widen intermediate_size
+        # (Inkling2MTPConfig); load_weights merges them onto the stock MLP tensors.
+        self.ffn_extra = int(getattr(config, "mtp_ffn_extra", 0) or 0)
+        # Research C2 (depth_experts): a per-depth input embedding on the mask rows and
+        # a per-depth low-rank expert on the final residual, before the final norm.
+        rank = int(getattr(config, "mtp_depth_experts", 0) or 0)
+        self.depth_experts = (
+            DepthExperts(rank, hidden, depths=self.block_size - 1) if rank else None
+        )
+        if self.depth_experts is not None:
+            self.norm.register_forward_pre_hook(
+                self.depth_experts.final_norm_pre_hook, with_kwargs=True
+            )
         self._fuse_alpha = None
         self._f_rnn_rows = None
         self._f_rnn_buf = None
@@ -232,7 +249,10 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             .clone()
         )
         hidden[:, 0, :] = self.embed_tokens(ids[:, 0]).to(hidden.dtype)
-        return hidden.view(-1, hidden.shape[-1])
+        hidden = hidden.view(-1, hidden.shape[-1])
+        if self.depth_experts is not None:
+            hidden = self.depth_experts.embed(hidden)
+        return hidden
 
     def ensure_propose_staging(self, req_pool_size):
         if self._f_rnn_buf is None:
@@ -301,6 +321,7 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         self._f_rnn_rows = self._f_rnn_buf.index_select(
             0, forward_batch.req_pool_indices.view(-1)[:batch_size].long()
         )
+        self._bind_block_size()
         input_embeds = self.forward_embed(input_ids)
         return DFlashDraftModel.forward(
             self,
@@ -310,6 +331,19 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             input_embeds=input_embeds,
             **kwargs,
         )
+
+    def _bind_block_size(self):
+        """Block-size-indexed research modules (K1 conv, C2 depth experts) take this
+        model view's block size. Routing width views share the layers but each runs
+        (and captures) its own forward, so each graph keeps its own width; QISO-x
+        drafts only at the checkpoint width."""
+        for layer in self.layers:
+            for name in ("attention_conv", "mlp_conv"):
+                conv = getattr(layer, name, None)
+                if conv is not None:
+                    conv.block_size = self.block_size
+        if self.depth_experts is not None:
+            self.depth_experts.block_size = self.block_size
 
     def project_target_hidden(self, target_hidden):
         raise RuntimeError(
@@ -396,7 +430,7 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             (".up_proj.", ".gate_up_proj.", 1),
         )
         loaded, shards = set(), {}
-        for checkpoint_name, weight in weights:
+        for checkpoint_name, weight in merge_ffn_extra(weights, self.ffn_extra):
             name, shard = checkpoint_name, None
             for source, destination, shard_id in mapping:
                 if source in name:
