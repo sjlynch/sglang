@@ -427,12 +427,19 @@ def _round_costs():
 ROUND_COSTS = _round_costs()
 
 
-def select_tracking_width(requests, phases):
+def select_tracking_width(requests, phases, alpha_of=None):
+    """P3. ``alpha_of(req)`` replaces the request's tracked thinking alpha (the
+    QISO-x shadow replays P3 on its own counterfactual observations)."""
     expected = [0.0] * len(WIDTHS)
     context_tokens = 0
     lookup = tracking_expectations()
     for req, thinking in zip(requests, phases):
-        alpha = req._inkling_draft_phase.alpha() if thinking else 0.958
+        if not thinking:
+            alpha = 0.958
+        elif alpha_of is not None:
+            alpha = alpha_of(req)
+        else:
+            alpha = req._inkling_draft_phase.alpha()
         for index, value in enumerate(lookup[round(alpha * 1000)]):
             expected[index] += value
         context_tokens += len(req.origin_input_ids) + len(req.output_ids)
@@ -475,6 +482,9 @@ class DepthCounts:
     qiso_widths: list[int] = field(default_factory=lambda: [0] * len(WIDTHS))
     qiso_accepted: int = 0
     fixed_accepted: list[int] = field(default_factory=lambda: [0] * len(WIDTHS))
+    # P3 replayed on the same rounds from its own counterfactual observations.
+    p3_widths: list[int] = field(default_factory=lambda: [0] * len(WIDTHS))
+    p3_accepted: int = 0
 
     def record(self, drafted, accepted):
         accepted = min(drafted, max(0, accepted))
@@ -505,6 +515,8 @@ class DepthCounts:
                 "widths": dict(zip(map(str, WIDTHS), self.qiso_widths)),
                 "accepted": self.qiso_accepted,
                 "fixed_accepted": dict(zip(map(str, WIDTHS), self.fixed_accepted)),
+                "p3_widths": dict(zip(map(str, WIDTHS), self.p3_widths)),
+                "p3_accepted": self.p3_accepted,
             }
         if self.suffix_checks:
             summary["anchor_suffix"] = {
@@ -517,7 +529,7 @@ class DepthCounts:
 
 
 def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=None, *, track_acceptance=False,
-                 qiso_width=None, draft_filter=None):
+                 qiso_width=None, draft_filter=None, p3_width=None):
     if track_acceptance and thinking:
         req._inkling_draft_phase.observe_acceptance(drafted, accepted)
     counts = getattr(req, "_inkling_draft_depth", None)
@@ -537,12 +549,29 @@ def record_round(req, thinking, tuned, drafted, accepted, suffix_observation=Non
         depth.qiso_accepted += min(accepted, qiso_width - 1)
         for i, width in enumerate(WIDTHS):
             depth.fixed_accepted[i] += min(accepted, width - 1)
+        if p3_width is not None:
+            depth.p3_widths[WIDTHS.index(p3_width)] += 1
+            depth.p3_accepted += min(accepted, p3_width - 1)
+            if thinking:
+                p3_shadow_phase(req).observe_acceptance(p3_width - 1, min(accepted, p3_width - 1))
     if suffix_observation is not None:
         match, elapsed_ns = suffix_observation
         depth.suffix_checks += 1
         depth.suffix_matches += match
         depth.suffix_match_width8 += match and drafted == 7
         depth.suffix_ns += elapsed_ns
+
+
+def p3_shadow_phase(req):
+    state = getattr(req, "_qiso_p3_phase", None)
+    if state is None:
+        state = req._qiso_p3_phase = RequestPhase()
+    return state
+
+
+def p3_shadow_width(requests, phases):
+    """The width P3 would choose this round from its counterfactual history."""
+    return select_tracking_width(requests, phases, alpha_of=lambda req: p3_shadow_phase(req).alpha())
 
 
 def telemetry(req):

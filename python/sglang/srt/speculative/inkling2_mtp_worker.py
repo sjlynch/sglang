@@ -23,6 +23,7 @@ from sglang.srt.speculative.inkling_draft_policy import (
     ROUND_COSTS,
     DraftPolicy,
     RequestPhase,
+    p3_shadow_width,
     select_batch_round,
     select_round,
     tracking_expectations,
@@ -212,6 +213,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         from sglang.srt.speculative.inkling_width_selector import ExactStopWidth
 
         self._qiso_rule = ExactStopWidth(self._qiso_table, device=self.device)
+        tracking_expectations()  # the shadow replays P3
         head, width = policy.pin
         worker = self._batch_workers[head * len(self._batch_width_index) + self._batch_width_index[width]]
         proposer = worker._proposer
@@ -353,6 +355,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             result.inkling_track_acceptance = policy.acceptance_tracking
             if self._qiso_rule is not None:
                 result.inkling_qiso_shadow = self._qiso_shadow(worker, batch, phases)
+                result.inkling_p3_shadow = p3_shadow_width(batch.reqs, phases)
             return result
         suffix_stats = [] if policy.anchor_suffix_width8 else None
         width, phases, variants = select_round(

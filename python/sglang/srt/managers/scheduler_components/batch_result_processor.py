@@ -1043,6 +1043,7 @@ class SchedulerBatchResultProcessor:
                         track_acceptance=result.inkling_track_acceptance,
                         qiso_width=qiso_width,
                         draft_filter=getattr(req, "_dspark_draft_filter", None),
+                        p3_width=result.inkling_p3_shadow if qiso_width is not None else None,
                     )
 
                 if block_accept_lens is not None:

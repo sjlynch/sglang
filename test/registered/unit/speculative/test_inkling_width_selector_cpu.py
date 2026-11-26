@@ -392,6 +392,19 @@ class ShadowManifestTests(unittest.TestCase):
         self.assertEqual(shadow["accepted"], 7 + 2 + 5 + 0)
         self.assertEqual(shadow["fixed_accepted"], {"4": 3 + 2 + 3 + 0, "5": 4 + 2 + 4 + 0,
                                                     "6": 5 + 2 + 5 + 0, "8": 7 + 2 + 5 + 0})
+        # P3 replayed on the same rounds: its widths and accepted drafts, and its
+        # counterfactual alpha history (thinking rows only).
+        req2 = SimpleNamespace(origin_input_ids=[1] * 100, output_ids=[2] * 10)
+        widths = []
+        for accepted in [7] * 20:
+            width = policy.p3_shadow_width([req2], (True,))
+            widths.append(width)
+            policy.record_round(req2, True, False, 7, accepted, qiso_width=8, p3_width=width)
+        shadow2 = policy.telemetry(req2)["thinking"]["stock"]["qiso_x_shadow"]
+        self.assertEqual(sum(shadow2["p3_widths"].values()), 20)
+        self.assertEqual(shadow2["p3_accepted"], sum(w - 1 for w in widths))
+        self.assertEqual(widths[-1], 8)  # all-accepting history drives P3 to width 8
+        self.assertGreater(req2._qiso_p3_phase.alpha(), 0.99)
         # Rounds verified below width 8 carry no counterfactual.
         policy.record_round(req, True, False, 3, 3, qiso_width=4)
         self.assertEqual(policy.telemetry(req)["thinking"]["stock"]["qiso_x_shadow"]["rounds"], 4)
