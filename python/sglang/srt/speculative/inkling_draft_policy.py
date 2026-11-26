@@ -33,7 +33,10 @@ WIDTH_SELECTOR_KEYS = {"kind", "path", "sha256", "mode"}
 # process serves QISO-x, P3 and fixed-width arms for an in-process panel (M1). A
 # round's batch takes one arm; a batch whose rows disagree runs the w4 control.
 WIDTH_ARM_PARAM = "inkling_width_arm"
-WIDTH_ARMS = ("qiso-x", "p3", "w4", "w5", "w6", "w8")
+# "qiso-x@W": the active dispatch path (width-8 draft, decision, bounded read) with
+# the verify forced to W: gate C's pinned-width identity against the native "wW".
+FORCED_WIDTH_ARMS = tuple(f"qiso-x@{w}" for w in WIDTHS)
+WIDTH_ARMS = ("qiso-x", "p3", "w4", "w5", "w6", "w8", *FORCED_WIDTH_ARMS)
 DEFAULT_WIDTH_ARM = "qiso-x"
 MIXED_WIDTH_ARM = "w4"
 WIDTH_SELECTOR_OPTIONAL = {"force_width"}
@@ -506,6 +509,11 @@ def batch_width_arm(requests):
     if len(arms) == 1:
         return arms.pop(), False
     return MIXED_WIDTH_ARM, True
+
+
+def arm_forced_width(arm):
+    """W for a "qiso-x@W" arm, None for plain "qiso-x"."""
+    return int(arm.split("@", 1)[1]) if arm.startswith("qiso-x@") else None
 
 
 def arm_width(arm, requests, phases):

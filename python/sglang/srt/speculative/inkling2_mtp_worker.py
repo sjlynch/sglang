@@ -24,6 +24,7 @@ from sglang.srt.speculative.inkling_draft_policy import (
     ROUND_COSTS,
     WIDTHS,
     DraftPolicy,
+    arm_forced_width,
     arm_width,
     batch_width_arm,
     RequestPhase,
@@ -309,7 +310,7 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             batch.reqs, qiso_phase_ids(batch.reqs),
         )
 
-    def _qiso_dispatch_round(self, batch, on_publish, grammar_barrier):
+    def _qiso_dispatch_round(self, batch, on_publish, grammar_barrier, force_width=None):
         """QISO-x active: draft with the width-8 graph, decide on the device, read
         the width once (the bounded sync), verify with that width's graph."""
         index = self._batch_width_index
@@ -321,7 +322,9 @@ class Inkling2MTPWorker(DSparkWorkerV2):
         round_state = {}
 
         def after_propose(proposal):
-            width, wait_ns, fallback = dispatcher.read_width(proposal.draft_block, bs, phase_ids, context)
+            width, wait_ns, fallback = dispatcher.read_width(
+                proposal.draft_block, bs, phase_ids, context, force_width=force_width
+            )
             round_state.update(width=width, wait_ns=wait_ns, fallback=fallback)
             worker = drafter if width == 8 else self._batch_workers[index[width]]
             worker._verify_executor.launched_ns = None
@@ -430,8 +433,10 @@ class Inkling2MTPWorker(DSparkWorkerV2):
             batch._inkling_draft_completed_channels = None
             if self._qiso_dispatcher is not None:
                 arm, mixed = batch_width_arm(batch.reqs)
-                if arm == "qiso-x":
-                    result = self._qiso_dispatch_round(batch, on_publish, grammar_barrier)
+                if arm == "qiso-x" or arm.startswith("qiso-x@"):
+                    result = self._qiso_dispatch_round(
+                        batch, on_publish, grammar_barrier, force_width=arm_forced_width(arm)
+                    )
                 else:
                     # P3 or a fixed width on its own native graph (in-process M1 arms).
                     width = arm_width(arm, batch.reqs, phases)

@@ -776,6 +776,8 @@ class WorkerProtocolTests(unittest.TestCase):
             (("w6", "w6"), 6, ("w6", False)),
             (("p3", "p3"), None, ("p3", False)),  # P3's own choice from its 0.70 prior
             (("w6", "p3"), 4, ("w4", True)),  # rows disagree: the w4 control
+            (("qiso-x@5", "qiso-x@5"), 5, ("qiso-x@5", False)),  # dispatch path, verify forced to 5
+            (("qiso-x@8", "qiso-x@8"), 8, ("qiso-x@8", False)),
         ):
             workers = {w: FakeWidthWorker(w) for w in sel.WIDTHS}
             worker = worker_mod.Inkling2MTPWorker.__new__(worker_mod.Inkling2MTPWorker)
@@ -795,7 +797,10 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertEqual(result.verified, want_width, arms)
             self.assertEqual(result.inkling_width_arm, want_arm)
             self.assertEqual(result.inkling_track_acceptance, want_arm[0] == "p3")
-            self.assertEqual(getattr(result, "inkling_qiso_active", None) is not None, want_arm[0] == "qiso-x")
+            self.assertEqual(getattr(result, "inkling_qiso_active", None) is not None,
+                             want_arm[0].startswith("qiso-x"))
+            if want_arm[0].startswith("qiso-x@"):
+                self.assertEqual(result.inkling_qiso_active[0], want_width)
             self.assertEqual(result.inkling_draft_route[0], (True, True))
 
     def test_width_arm_validation_and_telemetry(self):

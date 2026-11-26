@@ -211,8 +211,10 @@ class QisoDispatcher:
         self._ready = torch.cuda.Event() if cuda else None
         self.sync_return_ns = None
 
-    def read_width(self, block, bs, phases, context_tokens):
-        """Returns (width, wait_ns, fallback). The only host sync of the round."""
+    def read_width(self, block, bs, phases, context_tokens, force_width=None):
+        """Returns (width, wait_ns, fallback). The only host sync of the round.
+        ``force_width`` (or the manifest's) pins the verify after the decision ran."""
+        force_width = force_width if force_width is not None else self.force_width
         out = self.decision.decide(block, bs, phases, context_tokens, out=self._width_dev)
         if out is None:
             self.sync_return_ns = perf_counter_ns()
@@ -226,10 +228,10 @@ class QisoDispatcher:
         width = int(self._width_host[0])
         if width not in WIDTHS:
             raise RuntimeError(f"QISO-x device rule returned width {width}")
-        if self.force_width is not None:
+        if force_width is not None:
             # Pinned-width identity: the decision still runs (same cost path), the
             # verify uses the pinned width.
-            width = self.force_width
+            width = force_width
         return width, self.sync_return_ns - start, False
 
     def bubble_ns(self, launched_ns):
